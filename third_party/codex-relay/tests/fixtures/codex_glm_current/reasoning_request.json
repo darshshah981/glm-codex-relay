@@ -1,0 +1,22 @@
+{
+  "model": "glm-5.2",
+  "instructions": "Use concise reasoning summaries.",
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [{ "type": "input_text", "text": "First question." }]
+    },
+    {
+      "type": "reasoning",
+      "summary": [{ "type": "summary_text", "text": "redacted reasoning summary" }]
+    },
+    {
+      "type": "message",
+      "role": "user",
+      "content": [{ "type": "input_text", "text": "Second question." }]
+    }
+  ],
+  "tools": [],
+  "stream": true
+}

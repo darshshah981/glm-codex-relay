@@ -1,0 +1,5 @@
+data: {"choices":[{"delta":{"role":"assistant","content":"OK"}}]}
+
+data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9,"prompt_tokens_details":{"cached_tokens":3}}}
+
+data: [DONE]

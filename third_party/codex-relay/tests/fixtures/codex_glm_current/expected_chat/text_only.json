@@ -1,0 +1,18 @@
+{
+  "model": "glm-5.2",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a concise coding assistant."
+    },
+    {
+      "role": "user",
+      "content": "Say OK."
+    }
+  ],
+  "temperature": 0.2,
+  "max_tokens": 128,
+  "stream_options": { "include_usage": true },
+  "thinking": { "type": "enabled" },
+  "stream": true
+}

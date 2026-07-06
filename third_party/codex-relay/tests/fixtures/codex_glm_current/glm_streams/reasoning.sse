@@ -1,0 +1,7 @@
+data: {"choices":[{"delta":{"role":"assistant","reasoning_content":"think "}}]}
+
+data: {"choices":[{"delta":{"reasoning_content":"briefly","content":"OK"}}]}
+
+data: {"choices":[],"usage":{"prompt_tokens":9,"completion_tokens":3,"total_tokens":12}}}
+
+data: [DONE]

@@ -1,0 +1,18 @@
+{
+  "model": "glm-5.2",
+  "instructions": "You are a concise coding assistant.",
+  "input": "Say OK.",
+  "tools": [],
+  "stream": true,
+  "temperature": 0.2,
+  "max_output_tokens": 128,
+  "tool_choice": "auto",
+  "parallel_tool_calls": true,
+  "prompt_cache_key": "redacted-cache-key",
+  "client_metadata": {
+    "codex_window_id": "redacted-window"
+  },
+  "reasoning": {
+    "effort": "high"
+  }
+}

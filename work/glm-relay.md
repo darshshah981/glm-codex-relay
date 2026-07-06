@@ -6,7 +6,7 @@ It does not store the raw Z.ai key. Set it only in the shell that starts the
 relay:
 
 ```bash
-export ZAI_RAW_KEY="api_id.secret"
+export ZAI_RAW_KEY="paste-your-zai-raw-key-here"
 ```
 
 ## One-time setup
@@ -63,6 +63,29 @@ Use the profile with Codex:
 ```bash
 codex --profile glm52-relay exec --skip-git-repo-check "Say exactly: GLM relay works"
 ```
+
+## Offline reliability checks
+
+Run the relay and wrapper reliability suite without live Z.ai credentials:
+
+```bash
+cargo test --manifest-path third_party/codex-relay/Cargo.toml
+python3 -m unittest discover -s tests
+```
+
+The Rust tests replay redacted Codex request fixtures and fake GLM SSE streams
+through the vendored relay. The Python tests cover wrapper behavior such as JWT
+generation, profile writing, install-source selection, default tool denylist,
+state metadata, and secret hygiene.
+
+Fixture refresh rules:
+
+```text
+keep: protocol shape, minimized tool schemas, representative stream chunks
+drop: raw keys, generated JWTs, bearer tokens, logs, relay history, full prompts
+```
+
+Use live GLM calls only as a final smoke test after the offline suite passes.
 
 ## Auth refresh
 

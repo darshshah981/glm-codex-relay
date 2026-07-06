@@ -1,0 +1,20 @@
+{
+  "model": "glm-5.2",
+  "messages": [
+    {
+      "role": "system",
+      "content": "Use concise reasoning summaries."
+    },
+    {
+      "role": "user",
+      "content": "First question."
+    },
+    {
+      "role": "user",
+      "content": "Second question."
+    }
+  ],
+  "stream_options": { "include_usage": true },
+  "thinking": { "type": "enabled" },
+  "stream": true
+}

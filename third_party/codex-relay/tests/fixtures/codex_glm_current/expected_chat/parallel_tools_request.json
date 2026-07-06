@@ -1,0 +1,29 @@
+{
+  "model": "glm-5.2",
+  "messages": [
+    {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        {
+          "id": "call_exec",
+          "type": "function",
+          "function": {
+            "name": "exec_command",
+            "arguments": "{\"cmd\":\"pwd\"}"
+          }
+        },
+        {
+          "id": "call_js",
+          "type": "function",
+          "function": {
+            "name": "mcp__node_repl-js",
+            "arguments": "{\"code\":\"1 + 1\"}"
+          }
+        }
+      ]
+    }
+  ],
+  "thinking": { "type": "enabled" },
+  "stream": false
+}
