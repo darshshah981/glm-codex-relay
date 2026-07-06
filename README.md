@@ -107,6 +107,8 @@ cargo test --manifest-path third_party/codex-relay/Cargo.toml
 python3 -m unittest discover -s tests
 ```
 
+GitHub Actions runs the same offline gates on pull requests.
+
 These checks prove:
 
 ```text
