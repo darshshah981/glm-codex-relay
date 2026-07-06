@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+import argparse
+import base64
+import hashlib
+import hmac
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+WORK = ROOT / "work"
+OUT = ROOT / "outputs"
+STATE = WORK / ".glm-relay"
+PID_FILE = STATE / "relay.pid"
+STATE_FILE = STATE / "state.json"
+LOG_FILE = OUT / "glm-relay.log"
+DEFAULT_PORT = 4453
+DEFAULT_UPSTREAM = "https://api.z.ai/api/coding/paas/v4"
+DEFAULT_MODEL = "glm-5.2"
+DEFAULT_REFRESH_MARGIN_SECONDS = 5 * 60
+DEFAULT_TOOL_DENYLIST = ",".join([
+    "spawn_agent",
+    "wait_agent",
+    "close_agent",
+    "multi_agent_v1-spawn_agent",
+    "multi_agent_v1-wait_agent",
+    "multi_agent_v1-close_agent",
+    "multi_agent_v1-resume_agent",
+    "multi_agent_v1-send_input",
+])
+
+
+def b64url(data):
+    if not isinstance(data, bytes):
+        data = json.dumps(data, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def ensure_dirs():
+    STATE.mkdir(parents=True, exist_ok=True)
+    OUT.mkdir(parents=True, exist_ok=True)
+
+
+def load_state():
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_state(state):
+    ensure_dirs()
+    STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def generate_zai_jwt(raw_key, ttl_seconds=3600):
+    raw_key = raw_key.strip()
+    if "." not in raw_key:
+        raise SystemExit("ZAI_RAW_KEY must be set to the Z.ai api_id.secret value")
+    api_id, secret = raw_key.split(".", 1)
+    if not api_id or not secret:
+        raise SystemExit("ZAI_RAW_KEY is malformed; expected api_id.secret")
+
+    now_ms = int(time.time() * 1000)
+    exp_ms = now_ms + ttl_seconds * 1000
+    header = {"alg": "HS256", "sign_type": "SIGN"}
+    payload = {"api_key": api_id, "exp": exp_ms, "timestamp": now_ms}
+    message = f"{b64url(header)}.{b64url(payload)}".encode("ascii")
+    signature = hmac.new(secret.encode("utf-8"), message, hashlib.sha256).digest()
+    return f"{message.decode('ascii')}.{b64url(signature)}", exp_ms // 1000
+
+
+def find_relay_binary():
+    explicit = os.environ.get("CODEX_RELAY_BIN")
+    if explicit:
+        path = Path(explicit).expanduser()
+        if path.exists():
+            return str(path)
+        raise SystemExit(f"CODEX_RELAY_BIN is set but not found: {path}")
+
+    path = shutil.which("codex-relay")
+    if path:
+        return path
+
+    venv_path = WORK / ".venv" / "bin" / "codex-relay"
+    if venv_path.exists():
+        return str(venv_path)
+
+    raise SystemExit(
+        "codex-relay binary not found. Run: work/glm-relay install-relay"
+    )
+
+
+def pid_from_file():
+    try:
+        return int(PID_FILE.read_text(encoding="utf-8").strip())
+    except Exception:
+        return None
+
+
+def process_alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def relay_is_running():
+    pid = pid_from_file()
+    return pid if process_alive(pid) else None
+
+
+def stop_relay():
+    pid = relay_is_running()
+    if not pid:
+        PID_FILE.unlink(missing_ok=True)
+        return False
+    os.kill(pid, signal.SIGTERM)
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if not process_alive(pid):
+            break
+        time.sleep(0.2)
+    if process_alive(pid):
+        os.kill(pid, signal.SIGKILL)
+    PID_FILE.unlink(missing_ok=True)
+    return True
+
+
+def start_relay(args):
+    ensure_dirs()
+    if relay_is_running():
+        if args.restart:
+            stop_relay()
+        else:
+            raise SystemExit(f"relay already running with pid {pid_from_file()}")
+
+    raw_key = os.environ.get("ZAI_RAW_KEY", "")
+    token, exp = generate_zai_jwt(raw_key, ttl_seconds=args.jwt_ttl_seconds)
+    relay_bin = find_relay_binary()
+
+    env = os.environ.copy()
+    env["CODEX_RELAY_UPSTREAM"] = args.upstream
+    env["CODEX_RELAY_API_KEY"] = token
+    env["CODEX_RELAY_PORT"] = str(args.port)
+    env["CODEX_RELAY_TOOL_DENYLIST"] = args.tool_denylist
+    env["CODEX_RELAY_HISTORY_STORE"] = args.history_store
+    env["CODEX_RELAY_HISTORY_DIR"] = str(STATE / "history")
+    env["RUST_LOG"] = args.log_level
+
+    if args.model_map:
+        env["CODEX_RELAY_MODEL_MAP"] = args.model_map
+    if args.upstream_extra_params:
+        env["CODEX_RELAY_UPSTREAM_EXTRA_PARAMS"] = args.upstream_extra_params
+    if args.drop_upstream_params:
+        env["CODEX_RELAY_DROP_PARAMS"] = args.drop_upstream_params
+
+    log = LOG_FILE.open("ab")
+    log.write(f"\n--- glm-relay start {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} ---\n".encode())
+    log.flush()
+    proc = subprocess.Popen(
+        [relay_bin],
+        cwd=str(ROOT),
+        env=env,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    PID_FILE.write_text(str(proc.pid), encoding="utf-8")
+    save_state({
+        "pid": proc.pid,
+        "port": args.port,
+        "upstream": args.upstream,
+        "model": args.model,
+        "jwt_expires_at": exp,
+        "jwt_refresh_margin_seconds": args.refresh_margin_seconds,
+        "relay_bin": relay_bin,
+        "log_file": str(LOG_FILE),
+        "started_at": int(time.time()),
+        "tool_denylist": args.tool_denylist,
+        "history_store": args.history_store,
+    })
+    print(f"started codex-relay pid={proc.pid} on http://127.0.0.1:{args.port}/v1")
+    print(f"jwt expires at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(exp))}")
+
+
+def restart_if_needed(args):
+    state = load_state()
+    pid = relay_is_running()
+    if not pid:
+        print("relay not running; starting")
+        start_relay(args)
+        return
+    exp = int(state.get("jwt_expires_at", 0))
+    margin = int(state.get("jwt_refresh_margin_seconds", args.refresh_margin_seconds))
+    if exp and time.time() < exp - margin:
+        remaining = int(exp - time.time())
+        print(f"relay ok pid={pid}; jwt has {remaining}s remaining")
+        return
+    print("jwt near expiry or unknown; restarting relay with fresh token")
+    stop_relay()
+    start_relay(args)
+
+
+def serve(args):
+    print("serving GLM relay; press Ctrl-C to stop")
+    try:
+        while True:
+            restart_if_needed(args)
+            time.sleep(args.check_interval_seconds)
+    except KeyboardInterrupt:
+        print("\nshutting down relay")
+        stop_relay()
+
+
+def status(_args):
+    state = load_state()
+    pid = relay_is_running()
+    if not pid:
+        print("stopped")
+        return 1
+    exp = int(state.get("jwt_expires_at", 0))
+    remaining = max(0, int(exp - time.time())) if exp else None
+    print(f"running pid={pid}")
+    print(f"url=http://127.0.0.1:{state.get('port', DEFAULT_PORT)}/v1")
+    print(f"upstream={state.get('upstream', DEFAULT_UPSTREAM)}")
+    print(f"log={state.get('log_file', str(LOG_FILE))}")
+    if remaining is not None:
+        print(f"jwt_remaining_seconds={remaining}")
+    return 0
+
+
+def install_relay(args):
+    ensure_dirs()
+    python = args.python or sys.executable
+    venv = WORK / ".venv"
+    if not (venv / "bin" / "python").exists():
+        subprocess.check_call([python, "-m", "venv", str(venv)])
+    pip = venv / "bin" / "python"
+    subprocess.check_call([str(pip), "-m", "pip", "install", "-U", "pip"])
+    subprocess.check_call([str(pip), "-m", "pip", "install", "-U", "codex-relay"])
+    print(venv / "bin" / "codex-relay")
+
+
+def write_profile(args):
+    profile_path = Path(args.output).expanduser()
+    profile = f'''model = "{args.model}"
+model_provider = "zai-relay"
+model_reasoning_effort = "xhigh"
+model_reasoning_summary = "none"
+model_catalog_json = "{ROOT / "work" / "glm-model-catalog.json"}"
+
+[model_providers.zai-relay]
+name = "Z.ai GLM-5.2 via local relay"
+base_url = "http://127.0.0.1:{args.port}/v1"
+wire_api = "responses"
+
+[model_properties."{args.model}"]
+context_window = 200000
+max_context_window = 200000
+supports_parallel_tool_calls = true
+supports_reasoning_summaries = true
+input_modalities = ["text"]
+'''
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    profile_path.write_text(profile, encoding="utf-8")
+    print(profile_path)
+
+
+def health(args):
+    import urllib.request
+    url = f"http://127.0.0.1:{args.port}/v1/models"
+    try:
+        with urllib.request.urlopen(url, timeout=args.timeout) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            print(f"ok status={resp.status}")
+            print(body[:1000])
+            return 0
+    except Exception as exc:
+        print(f"health failed: {exc}")
+        return 1
+
+
+def logs(args):
+    if not LOG_FILE.exists():
+        print(f"log not found: {LOG_FILE}")
+        return 1
+    lines = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+    for line in lines[-args.lines:]:
+        print(line)
+    return 0
+
+
+def add_common_start_args(parser):
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--upstream", default=DEFAULT_UPSTREAM)
+    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--jwt-ttl-seconds", type=int, default=3600)
+    parser.add_argument("--refresh-margin-seconds", type=int, default=DEFAULT_REFRESH_MARGIN_SECONDS)
+    parser.add_argument("--tool-denylist", default=DEFAULT_TOOL_DENYLIST)
+    parser.add_argument("--history-store", choices=["memory", "disk"], default="disk")
+    parser.add_argument("--model-map", default="")
+    parser.add_argument("--upstream-extra-params", default="")
+    parser.add_argument("--drop-upstream-params", default="")
+    parser.add_argument("--log-level", default="codex_relay=debug")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Manage a local codex-relay instance for Z.ai GLM-5.2."
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("install-relay", help="Install codex-relay into work/.venv")
+    p.add_argument("--python", default=os.environ.get("GLM_RELAY_PYTHON", ""))
+    p.set_defaults(func=install_relay)
+
+    p = sub.add_parser("start", help="Start codex-relay with a fresh Z.ai JWT")
+    add_common_start_args(p)
+    p.add_argument("--restart", action="store_true")
+    p.set_defaults(func=start_relay)
+
+    p = sub.add_parser("restart", help="Restart codex-relay with a fresh Z.ai JWT")
+    add_common_start_args(p)
+    p.set_defaults(func=lambda args: (stop_relay(), start_relay(args)))
+    p.set_defaults(restart=True)
+
+    p = sub.add_parser("refresh", help="Restart relay only when JWT is near expiry")
+    add_common_start_args(p)
+    p.set_defaults(func=restart_if_needed)
+
+    p = sub.add_parser("serve", help="Run a foreground supervisor that refreshes JWTs")
+    add_common_start_args(p)
+    p.add_argument("--check-interval-seconds", type=int, default=60)
+    p.set_defaults(func=serve)
+
+    p = sub.add_parser("stop", help="Stop codex-relay")
+    p.set_defaults(func=lambda _args: print("stopped" if stop_relay() else "not running"))
+
+    p = sub.add_parser("status", help="Show relay status")
+    p.set_defaults(func=status)
+
+    p = sub.add_parser("health", help="Call local /v1/models")
+    p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p.add_argument("--timeout", type=float, default=5.0)
+    p.set_defaults(func=health)
+
+    p = sub.add_parser("logs", help="Show recent relay logs")
+    p.add_argument("--lines", type=int, default=80)
+    p.set_defaults(func=logs)
+
+    p = sub.add_parser("write-profile", help="Write ~/.codex/glm52-relay.config.toml")
+    p.add_argument("--output", default="~/.codex/glm52-relay.config.toml")
+    p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p.add_argument("--model", default=DEFAULT_MODEL)
+    p.set_defaults(func=write_profile)
+
+    args = parser.parse_args()
+    result = args.func(args)
+    if isinstance(result, int):
+        raise SystemExit(result)
+
+
+if __name__ == "__main__":
+    main()
