@@ -1,0 +1,65 @@
+{
+  "model": "deepseek-v4-pro",
+  "instructions": "system",
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [{ "type": "input_text", "text": "hi" }]
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "name": "exec_command",
+      "description": "Run a shell command",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": { "cmd": { "type": "string" } },
+        "required": ["cmd"]
+      }
+    },
+    {
+      "type": "web_search",
+      "external_web_access": true
+    },
+    {
+      "type": "image_generation",
+      "output_format": "png"
+    },
+    {
+      "type": "namespace",
+      "name": "mcp__codex_apps__github",
+      "description": "GitHub MCP plugin",
+      "tools": [
+        {
+          "type": "function",
+          "name": "_add_comment_to_issue",
+          "description": "Add a comment to an issue.",
+          "strict": false,
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "comment": { "type": "string" },
+              "pr_number": { "type": "integer" }
+            },
+            "required": ["pr_number", "comment"]
+          }
+        },
+        {
+          "type": "function",
+          "name": "_close_issue",
+          "description": "Close an issue.",
+          "strict": false,
+          "parameters": {
+            "type": "object",
+            "properties": { "issue_number": { "type": "integer" } },
+            "required": ["issue_number"]
+          }
+        }
+      ]
+    }
+  ],
+  "stream": false
+}

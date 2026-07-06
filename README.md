@@ -25,7 +25,12 @@ Z.ai GLM-5.2 Chat Completions
 work/glm-relay              Wrapper CLI for installing, starting, refreshing, and stopping the relay
 work/glm-relay.md           Operational notes
 work/glm-model-catalog.json Local Codex model catalog entry for glm-5.2
+third_party/codex-relay/    Vendored codex-relay source code
 ```
+
+`third_party/codex-relay` is copied from
+[`MetaFARS/codex-relay`](https://github.com/MetaFARS/codex-relay) and keeps its
+upstream MIT license in `third_party/codex-relay/LICENSE`.
 
 The wrapper does not store the raw Z.ai key or generated JWT. Set the raw key
 only in the shell that starts the relay:
@@ -40,6 +45,14 @@ Install `codex-relay` into a local virtual environment:
 
 ```bash
 work/glm-relay install-relay
+```
+
+By default, `install-relay` uses the vendored source when Rust is available and
+falls back to PyPI's prebuilt wheel otherwise. You can choose explicitly:
+
+```bash
+work/glm-relay install-relay --source vendored
+work/glm-relay install-relay --source pypi
 ```
 
 If you are running this from Codex Desktop and want to use the bundled Python:

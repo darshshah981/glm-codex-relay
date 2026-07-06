@@ -20,6 +20,7 @@ STATE = WORK / ".glm-relay"
 PID_FILE = STATE / "relay.pid"
 STATE_FILE = STATE / "state.json"
 LOG_FILE = OUT / "glm-relay.log"
+VENDORED_RELAY = ROOT / "third_party" / "codex-relay"
 DEFAULT_PORT = 4453
 DEFAULT_UPSTREAM = "https://api.z.ai/api/coding/paas/v4"
 DEFAULT_MODEL = "glm-5.2"
@@ -251,7 +252,20 @@ def install_relay(args):
         subprocess.check_call([python, "-m", "venv", str(venv)])
     pip = venv / "bin" / "python"
     subprocess.check_call([str(pip), "-m", "pip", "install", "-U", "pip"])
-    subprocess.check_call([str(pip), "-m", "pip", "install", "-U", "codex-relay"])
+
+    source = args.source
+    if source == "auto":
+        has_vendored = (VENDORED_RELAY / "pyproject.toml").exists()
+        has_rust = shutil.which("cargo") and shutil.which("rustc")
+        source = "vendored" if has_vendored and has_rust else "pypi"
+
+    if source == "vendored":
+        if not (VENDORED_RELAY / "pyproject.toml").exists():
+            raise SystemExit(f"vendored codex-relay source not found: {VENDORED_RELAY}")
+        subprocess.check_call([str(pip), "-m", "pip", "install", "-U", str(VENDORED_RELAY)])
+    else:
+        subprocess.check_call([str(pip), "-m", "pip", "install", "-U", "codex-relay"])
+
     print(venv / "bin" / "codex-relay")
 
 
@@ -326,6 +340,12 @@ def main():
 
     p = sub.add_parser("install-relay", help="Install codex-relay into work/.venv")
     p.add_argument("--python", default=os.environ.get("GLM_RELAY_PYTHON", ""))
+    p.add_argument(
+        "--source",
+        choices=["auto", "pypi", "vendored"],
+        default="auto",
+        help="Install codex-relay from vendored source when possible, or PyPI prebuilt wheels",
+    )
     p.set_defaults(func=install_relay)
 
     p = sub.add_parser("start", help="Start codex-relay with a fresh Z.ai JWT")

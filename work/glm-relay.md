@@ -22,6 +22,15 @@ This installs `codex-relay` into `work/.venv` and writes:
 ~/.codex/glm52-relay.config.toml
 ```
 
+By default, install uses the vendored `third_party/codex-relay` source when Rust
+is available and falls back to PyPI's prebuilt wheel otherwise:
+
+```bash
+work/glm-relay install-relay --source auto
+work/glm-relay install-relay --source vendored
+work/glm-relay install-relay --source pypi
+```
+
 The profile also points Codex at a local model catalog:
 
 ```text
@@ -103,6 +112,7 @@ work/glm-relay restart --tool-denylist ""
 ```text
 work/glm-relay                 wrapper CLI
 work/glm-model-catalog.json    Codex model catalog entry for glm-5.2
+third_party/codex-relay/       vendored codex-relay source, MIT licensed
 work/.venv/                    local codex-relay install
 work/.glm-relay/relay.pid      relay pid
 work/.glm-relay/state.json     non-secret state
