@@ -185,6 +185,69 @@ class GlmRelayWrapperTests(unittest.TestCase):
 
             self.assertEqual(calls[-1][-1], "codex-relay")
 
+    def test_live_smoke_requires_key_when_relay_is_not_running(self):
+        args = argparse.Namespace(
+            port=4453,
+            upstream="https://api.z.ai/api/coding/paas/v4",
+            model="glm-5.2",
+            jwt_ttl_seconds=3600,
+            refresh_margin_seconds=300,
+            tool_denylist=self.mod.DEFAULT_TOOL_DENYLIST,
+            history_store="disk",
+            model_map="",
+            upstream_extra_params="",
+            drop_upstream_params="",
+            log_level="codex_relay=debug",
+            timeout=1.0,
+            include_tool_call=False,
+            keep_running=False,
+        )
+
+        with mock.patch.object(self.mod, "relay_is_running", return_value=None):
+            with mock.patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(SystemExit) as caught:
+                    self.mod.live_smoke(args)
+
+        self.assertIn("ZAI_RAW_KEY is required", str(caught.exception))
+
+    def test_smoke_payloads_are_small_and_non_streaming(self):
+        text_payload = self.mod.text_smoke_payload("glm-5.2")
+        tool_payload = self.mod.tool_smoke_payload("glm-5.2")
+
+        self.assertEqual(text_payload["model"], "glm-5.2")
+        self.assertIs(text_payload["stream"], False)
+        self.assertLessEqual(text_payload["max_output_tokens"], 64)
+
+        tool_names = [tool["name"] for tool in tool_payload["tools"]]
+        self.assertIn("exec_command", tool_names)
+        self.assertIn("spawn_agent", tool_names)
+        self.assertIs(tool_payload["stream"], False)
+
+    def test_extract_smoke_outputs(self):
+        response = {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {"type": "output_text", "text": "GLM_"},
+                        {"type": "output_text", "text": "SMOKE_OK"},
+                    ],
+                },
+                {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": "call_1",
+                    "arguments": "{\"cmd\":\"echo GLM_TOOL_OK\"}",
+                },
+            ]
+        }
+
+        self.assertEqual(self.mod.extract_output_text(response), "GLM_SMOKE_OK")
+        self.assertEqual(
+            self.mod.output_function_calls(response)[0]["name"],
+            "exec_command",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

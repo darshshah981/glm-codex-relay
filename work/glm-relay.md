@@ -87,6 +87,30 @@ drop: raw keys, generated JWTs, bearer tokens, logs, relay history, full prompts
 
 Use live GLM calls only as a final smoke test after the offline suite passes.
 
+## Live smoke
+
+The live smoke answers a different question than the offline suite:
+
+```text
+offline tests -> does our relay logic work for known protocol shapes?
+live smoke    -> do current Z.ai auth, endpoint, model, and relay wiring work now?
+```
+
+Run it only when you are ready to spend a tiny live request:
+
+```bash
+export ZAI_RAW_KEY="paste-your-zai-raw-key-here"
+work/glm-relay live-smoke
+```
+
+By default it starts the relay if needed, sends one small text request through
+`/v1/responses`, verifies output text came back, and stops the smoke relay.
+Use the stricter optional tool-call check after the text smoke passes:
+
+```bash
+work/glm-relay live-smoke --include-tool-call
+```
+
 ## Auth refresh
 
 Z.ai uses a generated JWT. The wrapper generates a fresh JWT when the relay

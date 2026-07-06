@@ -137,6 +137,24 @@ Live GLM checks are still useful as a final smoke test, but they are not the
 foundation for reliability because they depend on credentials, provider
 availability, and account balance.
 
+Run a live smoke only after the offline suite is green:
+
+```bash
+export ZAI_RAW_KEY="paste-your-zai-raw-key-here"
+work/glm-relay live-smoke
+```
+
+This starts the relay if needed, makes one real text request through GLM-5.2,
+and stops the smoke relay afterward. It proves current auth, endpoint, model,
+and relay wiring. To also ask GLM for a normal tool call, run:
+
+```bash
+work/glm-relay live-smoke --include-tool-call
+```
+
+The tool-call check is stricter and more provider-behavior-sensitive, so keep
+the text smoke as the first live gate.
+
 ## Tool policy
 
 By default, v1 hides Codex subagent / multi-agent runtime tools from GLM:

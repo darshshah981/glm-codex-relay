@@ -10,6 +10,8 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 
@@ -295,7 +297,6 @@ input_modalities = ["text"]
 
 
 def health(args):
-    import urllib.request
     url = f"http://127.0.0.1:{args.port}/v1/models"
     try:
         with urllib.request.urlopen(url, timeout=args.timeout) as resp:
@@ -306,6 +307,148 @@ def health(args):
     except Exception as exc:
         print(f"health failed: {exc}")
         return 1
+
+
+def post_json(url, payload, timeout):
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            return resp.status, json.loads(body)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise SystemExit(f"live smoke failed: relay returned {exc.code}: {body}") from exc
+    except urllib.error.URLError as exc:
+        raise SystemExit(f"live smoke failed: cannot reach local relay: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"live smoke failed: relay returned non-JSON: {exc}") from exc
+
+
+def extract_output_text(response):
+    texts = []
+    for item in response.get("output", []):
+        if item.get("type") != "message":
+            continue
+        for part in item.get("content", []):
+            if part.get("type") == "output_text" and part.get("text"):
+                texts.append(part["text"])
+    return "".join(texts)
+
+
+def output_function_calls(response):
+    return [
+        item
+        for item in response.get("output", [])
+        if item.get("type") == "function_call"
+    ]
+
+
+def text_smoke_payload(model):
+    return {
+        "model": model,
+        "instructions": "Reply concisely.",
+        "input": "Reply with exactly: GLM_SMOKE_OK",
+        "stream": False,
+        "temperature": 0,
+        "max_output_tokens": 64,
+    }
+
+
+def tool_smoke_payload(model):
+    return {
+        "model": model,
+        "instructions": (
+            "You are testing tool-call wiring. Call exec_command exactly once "
+            "with cmd set to echo GLM_TOOL_OK. Do not call any other tool."
+        ),
+        "input": "Use the available tool for the harmless echo check.",
+        "tools": [
+            {
+                "type": "function",
+                "name": "exec_command",
+                "description": "Run a harmless shell command.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"cmd": {"type": "string"}},
+                    "required": ["cmd"],
+                },
+            },
+            {
+                "type": "function",
+                "name": "spawn_agent",
+                "description": "Denied subagent tool that should not reach GLM.",
+                "parameters": {"type": "object"},
+            },
+        ],
+        "stream": False,
+        "temperature": 0,
+        "max_output_tokens": 128,
+    }
+
+
+def live_smoke(args):
+    started_by_smoke = False
+    pid = relay_is_running()
+    if not pid:
+        if not os.environ.get("ZAI_RAW_KEY"):
+            raise SystemExit(
+                "ZAI_RAW_KEY is required to start the relay for a live smoke. "
+                "Set it in this shell, then rerun: work/glm-relay live-smoke"
+            )
+        start_args = argparse.Namespace(**vars(args))
+        start_args.restart = False
+        start_args.history_store = "memory"
+        start_relay(start_args)
+        started_by_smoke = True
+    else:
+        print(f"using running relay pid={pid}")
+
+    try:
+        state = load_state()
+        port = int(state.get("port", args.port))
+        url = f"http://127.0.0.1:{port}/v1/responses"
+
+        print("checking text response through live GLM endpoint")
+        _status, text_response = post_json(
+            url,
+            text_smoke_payload(args.model),
+            timeout=args.timeout,
+        )
+        text = extract_output_text(text_response).strip()
+        if not text:
+            raise SystemExit("live smoke failed: text response contained no output text")
+        print(f"text ok: {text[:120]}")
+
+        if args.include_tool_call:
+            print("checking optional normal tool-call response")
+            _status, tool_response = post_json(
+                url,
+                tool_smoke_payload(args.model),
+                timeout=args.timeout,
+            )
+            calls = output_function_calls(tool_response)
+            denied = [call for call in calls if call.get("name") == "spawn_agent"]
+            if denied:
+                raise SystemExit("live smoke failed: denied spawn_agent tool was returned")
+            exec_calls = [call for call in calls if call.get("name") == "exec_command"]
+            if not exec_calls:
+                raise SystemExit(
+                    "live smoke failed: GLM did not return an exec_command tool call"
+                )
+            print(f"tool ok: exec_command call_id={exec_calls[0].get('call_id', '')}")
+
+        print("live smoke passed")
+        return 0
+    finally:
+        if started_by_smoke and not args.keep_running:
+            stop_relay()
+            print("stopped smoke relay")
 
 
 def logs(args):
@@ -377,6 +520,21 @@ def main():
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
     p.add_argument("--timeout", type=float, default=5.0)
     p.set_defaults(func=health)
+
+    p = sub.add_parser("live-smoke", help="Run a small live GLM end-to-end smoke test")
+    add_common_start_args(p)
+    p.add_argument("--timeout", type=float, default=60.0)
+    p.add_argument(
+        "--include-tool-call",
+        action="store_true",
+        help="Also ask GLM to return a normal exec_command tool call",
+    )
+    p.add_argument(
+        "--keep-running",
+        action="store_true",
+        help="Leave a relay started by the smoke running after the check",
+    )
+    p.set_defaults(func=live_smoke)
 
     p = sub.add_parser("logs", help="Show recent relay logs")
     p.add_argument("--lines", type=int, default=80)
