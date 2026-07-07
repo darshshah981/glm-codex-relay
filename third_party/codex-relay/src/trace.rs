@@ -128,7 +128,10 @@ impl TraceHandle {
         };
 
         let seq = {
-            let mut seq = inner.seq.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut seq = inner
+                .seq
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             *seq += 1;
             *seq
         };
@@ -143,7 +146,10 @@ impl TraceHandle {
             "data": data,
         });
 
-        let mut file = inner.file.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut file = inner
+            .file
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if file.is_none() {
             if let Some(parent) = inner.path.parent() {
                 create_dir_all(parent)?;
