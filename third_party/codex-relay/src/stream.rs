@@ -12,6 +12,7 @@ use tracing::{debug, error, warn};
 
 use crate::{
     session::SessionStore,
+    trace::{self, TraceHandle},
     translate::{response_function_name_for_responses, NamespaceToolMap},
     types::{ChatMessage, ChatRequest, ChatStreamChunk, ChatUsage},
     upstream_request::UpstreamRequestConfig,
@@ -31,6 +32,7 @@ pub struct StreamArgs {
     pub request_messages: Vec<ChatMessage>,
     pub namespace_tools: NamespaceToolMap,
     pub model: String,
+    pub trace: TraceHandle,
 }
 
 struct ToolCallAccum {
@@ -74,11 +76,21 @@ pub fn translate_stream(
         request_messages,
         namespace_tools,
         model,
+        trace,
     } = args;
     let msg_item_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
     let reasoning_item_id = format!("rs_{}", uuid::Uuid::new_v4().simple());
 
     let event_stream = stream! {
+        trace.emit(
+            "response.created",
+            json!({
+                "id": &response_id,
+                "model": &model,
+                "status": "in_progress",
+                "stream": true,
+            }),
+        );
         yield Ok(Event::default()
             .event("response.created")
             .data(json!({
@@ -95,12 +107,20 @@ pub fn translate_stream(
             Ok(body) => body,
             Err(e) => {
                 error!("upstream request body error: {e}");
+                trace.emit(
+                    "relay.failed",
+                    json!({"code": "request_body_error", "message": e.to_string()}),
+                );
                 yield Ok(Event::default().event("response.failed").data(
                     json!({"type": "response.failed", "response": {"id": &response_id, "status": "failed", "error": {"code": "request_body_error", "message": e.to_string()}}}).to_string()
                 ));
                 return;
             }
         };
+        trace.emit(
+            "relay.upstream_request",
+            trace::chat_request_summary(&chat_req, &upstream_body),
+        );
 
         let upstream = match builder.json(&upstream_body).send().await {
             Ok(r) if r.status().is_success() => r,
@@ -108,6 +128,14 @@ pub fn translate_stream(
                 let status = r.status();
                 let body = r.text().await.unwrap_or_default();
                 error!("upstream {status}: {body}");
+                trace.emit(
+                    "glm.failed",
+                    json!({
+                        "code": status.as_u16().to_string(),
+                        "status": status.as_u16(),
+                        "message": body,
+                    }),
+                );
                 yield Ok(Event::default().event("response.failed").data(
                     json!({"type": "response.failed", "response": {"id": &response_id, "status": "failed", "error": {"code": status.as_u16().to_string(), "message": body}}}).to_string()
                 ));
@@ -115,6 +143,10 @@ pub fn translate_stream(
             }
             Err(e) => {
                 error!("upstream request failed: {e}");
+                trace.emit(
+                    "glm.failed",
+                    json!({"code": "connection_error", "message": e.to_string()}),
+                );
                 yield Ok(Event::default().event("response.failed").data(
                     json!({"type": "response.failed", "response": {"id": &response_id, "status": "failed", "error": {"code": "connection_error", "message": e.to_string()}}}).to_string()
                 ));
@@ -138,20 +170,32 @@ pub fn translate_stream(
             match ev {
                 Err(e) => {
                     warn!("SSE parse error: {e}");
+                    trace.emit(
+                        "glm.stream_error",
+                        json!({"message": e.to_string()}),
+                    );
                     stream_err = true;
                     break;
                 }
                 Ok(ev) if ev.data.trim() == "[DONE]" => {
+                    trace.emit("glm.stream_done", json!({}));
                     stream_done = true;
                     break;
                 }
                 Ok(ev) if ev.data.is_empty() => continue,
                 Ok(ev) => {
                     match serde_json::from_str::<ChatStreamChunk>(&ev.data) {
-                        Err(e) => warn!("chunk parse error: {e} — data: {}", ev.data),
+                        Err(e) => {
+                            warn!("chunk parse error: {e} — data: {}", ev.data);
+                            trace.emit(
+                                "glm.chunk_parse_error",
+                                json!({"message": e.to_string()}),
+                            );
+                        }
                         Ok(chunk) => {
                             let ChatStreamChunk { choices, usage } = chunk;
                             if usage.is_some() {
+                                trace.emit("glm.usage", trace::usage_summary(usage.as_ref()));
                                 stream_usage = usage;
                             }
                             for choice in &choices {
@@ -182,6 +226,7 @@ pub fn translate_stream(
                                             }
                                         };
                                         accumulated_reasoning.push_str(rc);
+                                        trace.emit("glm.reasoning.delta", trace::text_delta(rc));
                                         yield Ok(Event::default()
                                             .event("response.reasoning_summary_text.delta")
                                             .data(json!({
@@ -220,6 +265,7 @@ pub fn translate_stream(
                                         }
                                     };
                                     accumulated_text.push_str(content);
+                                    trace.emit("glm.text.delta", trace::text_delta(content));
                                     yield Ok(Event::default()
                                         .event("response.output_text.delta")
                                         .data(json!({
@@ -252,6 +298,15 @@ pub fn translate_stream(
                                             if let Some(a) = &f.arguments {
                                                 entry.arguments.push_str(a);
                                             }
+                                            trace.emit(
+                                                "glm.tool_call.delta",
+                                                trace::tool_call_delta(
+                                                    tc.index,
+                                                    &entry.id,
+                                                    &entry.name,
+                                                    f.arguments.as_deref().unwrap_or(""),
+                                                ),
+                                            );
                                         }
                                     }
                                 }
@@ -439,6 +494,20 @@ pub fn translate_stream(
                 .collect();
             let usage = stream_usage.unwrap_or_default();
             debug!("cache(stream): {}", usage.cache_summary());
+            trace.emit(
+                "response.completed",
+                json!({
+                    "id": &response_id,
+                    "model": &model,
+                    "output_count": output_items.len(),
+                    "usage": {
+                        "input_tokens": usage.prompt_tokens,
+                        "output_tokens": usage.completion_tokens,
+                        "total_tokens": usage.total_tokens,
+                        "cached_tokens": usage.cache_hit(),
+                    }
+                }),
+            );
 
             yield Ok(Event::default()
                 .event("response.completed")
@@ -464,6 +533,14 @@ pub fn translate_stream(
             // to avoid creating an assistant-with-tool_calls gap in history
             // that causes upstream "insufficient tool messages" errors.
             warn!("stream disconnected before [DONE] — discarding partial turn");
+            trace.emit(
+                "response.failed",
+                json!({
+                    "id": &response_id,
+                    "code": "stream_incomplete",
+                    "message": "stream disconnected before completion",
+                }),
+            );
             yield Ok(Event::default()
                 .event("response.failed")
                 .data(json!({

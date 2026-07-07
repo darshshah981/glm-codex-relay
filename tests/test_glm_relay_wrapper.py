@@ -64,6 +64,16 @@ class GlmRelayWrapperTests(unittest.TestCase):
         (run_dir / "summary.txt").write_text(summary, encoding="utf-8")
         return run_dir
 
+    def write_trace_file(self, trace_root, run_id, events):
+        trace_dir = Path(trace_root) / "runs" / run_id
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        path = trace_dir / "trace_1.jsonl"
+        path.write_text(
+            "\n".join(json.dumps(event) for event in events) + "\n",
+            encoding="utf-8",
+        )
+        return path
+
     def test_generate_zai_jwt_from_raw_key(self):
         token, exp = self.mod.generate_zai_jwt("test-api-id.test-secret", ttl_seconds=60)
 
@@ -131,6 +141,8 @@ class GlmRelayWrapperTests(unittest.TestCase):
             self.mod.PID_FILE = self.mod.STATE / "relay.pid"
             self.mod.STATE_FILE = self.mod.STATE / "state.json"
             self.mod.LOG_FILE = self.mod.OUT / "glm-relay.log"
+            self.mod.TRACE_DIR = self.mod.STATE / "traces"
+            self.mod.ACTIVE_WORKER_FILE = self.mod.STATE / "active-worker.json"
 
             args = argparse.Namespace(
                 restart=False,
@@ -160,6 +172,10 @@ class GlmRelayWrapperTests(unittest.TestCase):
             self.assertEqual(state["upstream_extra_params"], "")
             self.assertEqual(state["drop_upstream_params"], "")
             self.assertIn("jwt_expires_at", state)
+            self.assertEqual(state["trace_dir"], str(self.mod.TRACE_DIR))
+            self.assertEqual(state["active_worker_file"], str(self.mod.ACTIVE_WORKER_FILE))
+            self.assertEqual(captured["env"]["CODEX_RELAY_TRACE_DIR"], str(self.mod.TRACE_DIR))
+            self.assertEqual(captured["env"]["CODEX_RELAY_ACTIVE_WORKER_FILE"], str(self.mod.ACTIVE_WORKER_FILE))
             self.assertNotIn("test-api-id.test-secret", state_text)
             self.assertNotIn("test-secret", state_text)
             self.assertNotIn(captured["env"]["CODEX_RELAY_API_KEY"], state_text)
@@ -452,6 +468,8 @@ class GlmRelayWrapperTests(unittest.TestCase):
             self.mod.STATE = tmp_path / "state"
             self.mod.STATE_FILE = self.mod.STATE / "state.json"
             self.mod.LOG_FILE = self.mod.OUT / "glm-relay.log"
+            self.mod.TRACE_DIR = self.mod.STATE / "traces"
+            self.mod.ACTIVE_WORKER_FILE = self.mod.STATE / "active-worker.json"
             self.mod.save_state({"port": 4453, "pid": 1234, "log_file": str(self.mod.LOG_FILE)})
             task = "Implement the tiny worker fixture"
             args = argparse.Namespace(
@@ -471,6 +489,7 @@ class GlmRelayWrapperTests(unittest.TestCase):
                 captured["argv"] = argv
                 captured["cwd"] = cwd
                 captured["env"] = env
+                captured["active_marker"] = json.loads(self.mod.ACTIVE_WORKER_FILE.read_text(encoding="utf-8"))
                 return subprocess.CompletedProcess(argv, 0, "ok\n", "")
 
             env_patch = {
@@ -497,6 +516,12 @@ class GlmRelayWrapperTests(unittest.TestCase):
             self.assertEqual(metadata["pid"], 1234)
             self.assertEqual(metadata["argv"][-1], "<redacted-task-prompt>")
             self.assertIn("git", metadata)
+            self.assertEqual(metadata["trace_dir"], str(self.mod.TRACE_DIR))
+            self.assertIn("work/glm-relay traces", metadata["trace_command"])
+            self.assertFalse(self.mod.ACTIVE_WORKER_FILE.exists())
+            self.assertEqual(captured["active_marker"]["model"], "glm-5.2")
+            self.assertEqual(captured["active_marker"]["prompt_path"], str(run_dir / "prompt.txt"))
+            self.assertNotIn(task, json.dumps(captured["active_marker"]))
             self.assertIn("before", metadata["git"])
             self.assertIn("after", metadata["git"])
             self.assertEqual(metadata["git"]["changed_files"], [])
@@ -884,6 +909,202 @@ class GlmRelayWrapperTests(unittest.TestCase):
 
         self.assertEqual(review["changed_files"], [])
         self.assertTrue(any("git context unavailable" in warning for warning in review["warnings"]))
+
+    def test_traces_thread_renders_worker_prompt_and_model_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            self.mod.WORKER_RUNS = tmp_path / "runs"
+            self.mod.STATE = tmp_path / "state"
+            self.mod.TRACE_DIR = self.mod.STATE / "traces"
+            run_dir = self.write_worker_run(
+                self.mod.WORKER_RUNS,
+                "20260707-010203-trace-me",
+                metadata={"exit_code": 0},
+                summary="summary\n",
+            )
+            (run_dir / "prompt.txt").write_text("Build the tiny traced thing", encoding="utf-8")
+            self.write_trace_file(
+                self.mod.TRACE_DIR,
+                run_dir.name,
+                [
+                    {
+                        "schema_version": "glm-relay-trace/v1",
+                        "trace_id": "trace_1",
+                        "run_id": run_dir.name,
+                        "seq": 1,
+                        "ts_unix_ms": 1,
+                        "event": "codex.request",
+                        "data": {
+                            "model": "glm-5.2",
+                            "stream": True,
+                            "tool_names": ["exec_command"],
+                            "instructions": {"preview": "Be concise", "chars": 10, "truncated": False},
+                            "input": {
+                                "kind": "text",
+                                "text": {"preview": "Use the tool", "chars": 12, "truncated": False},
+                            },
+                        },
+                    },
+                    {
+                        "schema_version": "glm-relay-trace/v1",
+                        "trace_id": "trace_1",
+                        "run_id": run_dir.name,
+                        "seq": 2,
+                        "ts_unix_ms": 2,
+                        "event": "glm.reasoning.delta",
+                        "data": {"text": "I should inspect first."},
+                    },
+                    {
+                        "schema_version": "glm-relay-trace/v1",
+                        "trace_id": "trace_1",
+                        "run_id": run_dir.name,
+                        "seq": 3,
+                        "ts_unix_ms": 3,
+                        "event": "glm.text.delta",
+                        "data": {"text": "Done."},
+                    },
+                    {
+                        "schema_version": "glm-relay-trace/v1",
+                        "trace_id": "trace_1",
+                        "run_id": run_dir.name,
+                        "seq": 4,
+                        "ts_unix_ms": 4,
+                        "event": "glm.tool_call.delta",
+                        "data": {
+                            "index": 0,
+                            "id": "call_1",
+                            "name": "exec_command",
+                            "arguments_delta": "{\"cmd\":\"echo ok\"}",
+                        },
+                    },
+                    {
+                        "schema_version": "glm-relay-trace/v1",
+                        "trace_id": "trace_1",
+                        "run_id": run_dir.name,
+                        "seq": 5,
+                        "ts_unix_ms": 5,
+                        "event": "response.completed",
+                        "data": {
+                            "id": "resp_1",
+                            "output_count": 2,
+                            "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+                        },
+                    },
+                ],
+            )
+            args = argparse.Namespace(target=run_dir.name, raw=False, full_prompts=False, follow=False, poll_seconds=0.1)
+
+            with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                code = self.mod.traces(args)
+
+        text = stdout.getvalue()
+        self.assertEqual(code, 0)
+        self.assertIn("trace thread:", text)
+        self.assertIn("worker prompt:", text)
+        self.assertIn("Build the tiny traced thing", text)
+        self.assertIn("codex -> glm: model=glm-5.2 stream=True tools=1 [exec_command]", text)
+        self.assertIn("thinking:", text)
+        self.assertIn("I should inspect first.", text)
+        self.assertIn("assistant:", text)
+        self.assertIn("Done.", text)
+        self.assertIn("tool calls:", text)
+        self.assertIn("exec_command", text)
+        self.assertIn("status: completed response_id=resp_1", text)
+
+    def test_traces_raw_outputs_jsonl_without_projection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            self.mod.WORKER_RUNS = tmp_path / "runs"
+            self.mod.STATE = tmp_path / "state"
+            self.mod.TRACE_DIR = self.mod.STATE / "traces"
+            run_dir = self.write_worker_run(self.mod.WORKER_RUNS, "raw-trace", metadata={"exit_code": 0})
+            trace_path = self.write_trace_file(
+                self.mod.TRACE_DIR,
+                run_dir.name,
+                [
+                    {
+                        "schema_version": "glm-relay-trace/v1",
+                        "trace_id": "trace_raw",
+                        "run_id": run_dir.name,
+                        "seq": 1,
+                        "ts_unix_ms": 1,
+                        "event": "glm.text.delta",
+                        "data": {"text": "raw"},
+                    }
+                ],
+            )
+            args = argparse.Namespace(target=run_dir.name, raw=True, full_prompts=False, follow=False, poll_seconds=0.1)
+
+            with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                code = self.mod.traces(args)
+            expected = trace_path.read_text(encoding="utf-8")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout.getvalue(), expected)
+
+    def test_traces_missing_events_for_worker_run_is_explained(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.mod.WORKER_RUNS = Path(tmp) / "runs"
+            self.mod.STATE = Path(tmp) / "state"
+            self.mod.TRACE_DIR = self.mod.STATE / "traces"
+            run_dir = self.write_worker_run(self.mod.WORKER_RUNS, "no-trace", metadata={"exit_code": 0})
+            args = argparse.Namespace(target=run_dir.name, raw=False, full_prompts=False, follow=False, poll_seconds=0.1)
+
+            with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                code = self.mod.traces(args)
+
+        self.assertEqual(code, 0)
+        self.assertIn("no trace events found", stdout.getvalue())
+        self.assertIn(str(run_dir.resolve()), stdout.getvalue())
+
+    def test_traces_latest_does_not_mix_newest_worker_with_older_trace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            self.mod.WORKER_RUNS = tmp_path / "runs"
+            self.mod.STATE = tmp_path / "state"
+            self.mod.TRACE_DIR = self.mod.STATE / "traces"
+            old_run = self.write_worker_run(self.mod.WORKER_RUNS, "old-with-trace", metadata={"exit_code": 0})
+            new_run = self.write_worker_run(self.mod.WORKER_RUNS, "new-without-trace", metadata={"exit_code": 0})
+            os.utime(old_run, (1, 1))
+            os.utime(new_run, (2, 2))
+            self.write_trace_file(
+                self.mod.TRACE_DIR,
+                old_run.name,
+                [
+                    {
+                        "schema_version": "glm-relay-trace/v1",
+                        "trace_id": "trace_old",
+                        "run_id": old_run.name,
+                        "seq": 1,
+                        "ts_unix_ms": 1,
+                        "event": "glm.text.delta",
+                        "data": {"text": "old trace"},
+                    }
+                ],
+            )
+            args = argparse.Namespace(target="latest", raw=False, full_prompts=False, follow=False, poll_seconds=0.1)
+
+            with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                code = self.mod.traces(args)
+
+        text = stdout.getvalue()
+        self.assertEqual(code, 0)
+        self.assertIn(new_run.name, text)
+        self.assertIn("no trace events found", text)
+        self.assertNotIn("old trace", text)
+
+    def test_read_new_trace_lines_returns_appended_lines_and_offset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trace.jsonl"
+            path.write_text("one\n", encoding="utf-8")
+
+            lines, offset = self.mod.read_new_trace_lines(path, 0)
+            path.write_text("one\ntwo\n", encoding="utf-8")
+            new_lines, new_offset = self.mod.read_new_trace_lines(path, offset)
+
+        self.assertEqual(lines, ["one"])
+        self.assertEqual(new_lines, ["two"])
+        self.assertGreater(new_offset, offset)
 
     def test_run_worker_parser_accepts_task_and_common_args(self):
         parser = argparse.ArgumentParser()

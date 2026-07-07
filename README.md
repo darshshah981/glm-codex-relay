@@ -201,6 +201,39 @@ worker output, inspect the actual git diff, and run relevant tests before
 trusting or shipping GLM's changes.
 Test this lane first with documentation-only tasks before trusting it for code changes.
 
+### Trace conversation view
+
+The relay also writes local trace events while the wrapper-managed relay is
+running. Think of the evidence layers this way:
+
+```text
+outputs/glm-worker-runs/      worker prompt, stdout/stderr, metadata, git snapshots
+work/.glm-relay/traces/       raw relay JSONL events for Responses <-> Chat traffic
+work/.glm-relay/history/      relay conversation memory for previous_response_id
+outputs/glm-relay.log         operational logs
+```
+
+Use the trace viewer when you want to see the worker run like a conversation:
+
+```bash
+work/glm-relay traces latest
+work/glm-relay traces <run-directory-name>
+work/glm-relay traces <run-directory-name> --raw
+work/glm-relay traces latest --full-prompts
+work/glm-relay traces latest --follow
+```
+
+The default view groups trace events into turns and shows the worker prompt,
+Codex request summary, system/instructions, user input, GLM thinking, assistant
+text, tool-call cards, usage, and final status. `--raw` prints the JSONL events
+unchanged for protocol debugging. `--full-prompts` expands local prompt/request
+previews that are compact by default. `--follow` polls for appended events so
+you can watch a running worker.
+
+Trace files are local sensitive data. They can contain prompts, tool output,
+repo context, and local paths. They should not be committed or shared without
+review.
+
 ## Tool policy
 
 By default, v1 hides Codex subagent / multi-agent runtime tools from GLM:
@@ -225,5 +258,6 @@ state. Treat it as sensitive:
 
 ```text
 work/.glm-relay/history/
+work/.glm-relay/traces/
 outputs/glm-worker-runs/
 ```
