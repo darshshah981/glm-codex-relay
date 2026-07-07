@@ -158,6 +158,41 @@ stdout/stderr tails. It does not accept, revert, delete, or test changes. Review
 the bundle, the actual git diff, and the relevant tests before trusting the GLM
 worker result.
 
+## Trace conversation view
+
+Worker artifacts tell you what the Codex worker process did at the shell level.
+Traces tell you what passed through the relay while that worker was running.
+The wrapper starts the relay with trace capture enabled and tags relay requests
+with the active worker run when `run-worker` is in progress.
+
+Use the default thread view first:
+
+```bash
+work/glm-relay traces latest
+work/glm-relay traces <run-directory-name>
+```
+
+The thread view is a projection of raw trace events. It groups each relay
+request into a readable turn: worker prompt, Codex request summary,
+system/instructions, user input, GLM thinking, assistant text, tool calls, usage,
+and final status.
+
+Use raw or expanded modes when debugging the relay itself:
+
+```bash
+work/glm-relay traces <run-directory-name> --raw
+work/glm-relay traces latest --full-prompts
+work/glm-relay traces latest --follow
+```
+
+`--raw` prints JSONL trace events unchanged. `--full-prompts` expands local
+prompt/request previews. `--follow` polls for appended trace lines so you can
+watch a live worker run without opening a dashboard.
+
+Traces are local sensitive data. They can include prompts, tool output, local
+paths, and repo context. Treat `work/.glm-relay/traces/` the same way as relay
+history and worker artifacts.
+
 ## Auth refresh
 
 Z.ai uses a generated JWT. The wrapper generates a fresh JWT when the relay
@@ -181,6 +216,7 @@ state. Treat this directory as sensitive:
 
 ```text
 work/.glm-relay/history/
+work/.glm-relay/traces/
 outputs/glm-worker-runs/
 ```
 
@@ -212,6 +248,7 @@ work/.venv/                    local codex-relay install
 work/.glm-relay/relay.pid      relay pid
 work/.glm-relay/state.json     non-secret state
 work/.glm-relay/history/       optional disk-backed relay history
+work/.glm-relay/traces/        local relay JSONL traces
 outputs/glm-worker-runs/       local GLM worker review bundles
 outputs/glm-relay.log          relay logs
 ```

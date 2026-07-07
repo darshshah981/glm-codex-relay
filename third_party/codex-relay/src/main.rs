@@ -1,5 +1,6 @@
 mod session;
 mod stream;
+mod trace;
 mod translate;
 mod types;
 mod upstream_request;
@@ -16,6 +17,7 @@ use clap::Parser;
 use reqwest::{Client, Url};
 use session::{SessionStore, DEFAULT_MAX_SESSIONS, DEFAULT_MAX_SESSION_BYTES, DEFAULT_SESSION_TTL};
 use std::{path::PathBuf, sync::Arc, time::Duration};
+use trace::TraceSink;
 use tracing::{debug, error, info, warn};
 use types::*;
 use upstream_request::UpstreamRequestConfig;
@@ -90,6 +92,14 @@ struct Args {
         default_value = ".codex-relay-history"
     )]
     history_dir: PathBuf,
+
+    /// Directory for local JSONL trace events. Disabled when unset.
+    #[arg(long, env = "CODEX_RELAY_TRACE_DIR")]
+    trace_dir: Option<PathBuf>,
+
+    /// Active GLM worker marker used to tag local traces with a worker run id.
+    #[arg(long, env = "CODEX_RELAY_ACTIVE_WORKER_FILE")]
+    active_worker_file: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -99,6 +109,7 @@ struct AppState {
     upstream: Arc<Url>,
     api_key: Arc<String>,
     upstream_request: Arc<UpstreamRequestConfig>,
+    trace: TraceSink,
 }
 
 #[tokio::main]
@@ -161,6 +172,7 @@ async fn main() -> Result<()> {
         upstream: Arc::new(upstream.clone()),
         api_key: api_key.clone(),
         upstream_request: upstream_request.clone(),
+        trace: TraceSink::new(args.trace_dir.clone(), args.active_worker_file.clone()),
     };
     info!(
         "session retention: store={} dir={} ttl={}h max_sessions={} max_session_memory={} MiB",
@@ -176,6 +188,11 @@ async fn main() -> Result<()> {
             upstream_request.extra_param_count(),
             upstream_request.drop_param_count()
         );
+    }
+    if state.trace.enabled() {
+        if let Some(path) = &args.trace_dir {
+            info!("trace events enabled: dir={}", path.display());
+        }
     }
 
     // Fetch upstream model list asynchronously for user visibility
@@ -578,6 +595,19 @@ async fn handle_responses(State(state): State<AppState>, body: axum::body::Bytes
 }
 
 async fn handle_responses_inner(state: AppState, req: ResponsesRequest) -> Response {
+    let trace = state.trace.start_trace();
+    let response_tool_names = response_tool_debug_names(&req.tools);
+    trace.emit(
+        "trace.started",
+        serde_json::json!({
+            "worker": trace.worker_context(),
+        }),
+    );
+    trace.emit(
+        "codex.request",
+        trace::responses_request_summary(&req, response_tool_names.clone()),
+    );
+
     let mut history = req
         .previous_response_id
         .as_deref()
@@ -585,6 +615,10 @@ async fn handle_responses_inner(state: AppState, req: ResponsesRequest) -> Respo
         .unwrap_or_default();
     if should_isolate_spawn_child_request(&req, &history) {
         debug!("isolating spawned child request from parent response history");
+        trace.emit(
+            "relay.history_isolated",
+            serde_json::json!({"reason": "spawn_child_request"}),
+        );
         history.clear();
     }
 
@@ -594,6 +628,14 @@ async fn handle_responses_inner(state: AppState, req: ResponsesRequest) -> Respo
     debug!(
         "→ upstream tools={}",
         summarize_debug_names(chat_tool_debug_names(&chat_req.tools))
+    );
+    trace.emit(
+        "relay.translation",
+        serde_json::json!({
+            "response_tool_names": response_tool_names,
+            "upstream_tool_names": chat_tool_debug_names(&chat_req.tools),
+            "namespace_tool_count": namespace_tools.len(),
+        }),
     );
     let url = format!("{}chat/completions", join_base(&state.upstream));
 
@@ -612,11 +654,12 @@ async fn handle_responses_inner(state: AppState, req: ResponsesRequest) -> Respo
             request_messages,
             namespace_tools,
             model,
+            trace,
         })
         .into_response()
     } else {
         chat_req.stream = false;
-        handle_blocking(state, chat_req, url, model, namespace_tools).await
+        handle_blocking(state, chat_req, url, model, namespace_tools, trace).await
     }
 }
 
@@ -719,6 +762,7 @@ async fn handle_blocking(
     url: String,
     model: String,
     namespace_tools: translate::NamespaceToolMap,
+    trace: trace::TraceHandle,
 ) -> Response {
     let mut builder = state
         .client
@@ -733,19 +777,39 @@ async fn handle_blocking(
         Ok(body) => body,
         Err(e) => {
             error!("upstream request body error: {e}");
+            trace.emit(
+                "relay.failed",
+                serde_json::json!({"code": "request_body_error", "message": e.to_string()}),
+            );
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
     };
+    trace.emit(
+        "relay.upstream_request",
+        trace::chat_request_summary(&chat_req, &upstream_body),
+    );
 
     match builder.json(&upstream_body).send().await {
         Err(e) => {
             error!("upstream error: {e}");
+            trace.emit(
+                "glm.failed",
+                serde_json::json!({"code": "connection_error", "message": e.to_string()}),
+            );
             (StatusCode::BAD_GATEWAY, e.to_string()).into_response()
         }
         Ok(r) if !r.status().is_success() => {
             let status = r.status();
             let body = r.text().await.unwrap_or_default();
             error!("upstream {status}: {body}");
+            trace.emit(
+                "glm.failed",
+                serde_json::json!({
+                    "code": status.as_u16().to_string(),
+                    "status": status.as_u16(),
+                    "message": body,
+                }),
+            );
             (
                 StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
                 body,
@@ -755,6 +819,10 @@ async fn handle_blocking(
         Ok(r) => match r.json::<ChatResponse>().await {
             Err(e) => {
                 error!("parse error: {e}");
+                trace.emit(
+                    "relay.failed",
+                    serde_json::json!({"code": "parse_error", "message": e.to_string()}),
+                );
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
             }
             Ok(chat_resp) => {
@@ -774,6 +842,10 @@ async fn handle_blocking(
                         tool_call_id: None,
                         name: None,
                     });
+                trace.emit(
+                    "glm.response",
+                    trace::chat_response_summary(&assistant_msg, chat_resp.usage.as_ref()),
+                );
 
                 let mut full_history = chat_req.messages.clone();
                 full_history.push(assistant_msg);
@@ -789,6 +861,20 @@ async fn handle_blocking(
                         &namespace_tools,
                     )
                 };
+                trace.emit(
+                    "response.completed",
+                    serde_json::json!({
+                        "id": &resp.id,
+                        "model": &resp.model,
+                        "output_count": resp.output.len(),
+                        "usage": {
+                            "input_tokens": resp.usage.input_tokens,
+                            "output_tokens": resp.usage.output_tokens,
+                            "total_tokens": resp.usage.total_tokens,
+                            "cached_tokens": resp.usage.input_tokens_details.as_ref().map(|details| details.cached_tokens).unwrap_or(0),
+                        }
+                    }),
+                );
                 Json(resp).into_response()
             }
         },
