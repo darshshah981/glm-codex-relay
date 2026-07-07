@@ -35,6 +35,35 @@ class GlmRelayWrapperTests(unittest.TestCase):
         padded = payload_segment + "=" * (-len(payload_segment) % 4)
         return json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
 
+    def git_snapshot(self, available=True, status=None, reason=""):
+        return {
+            "available": available,
+            "reason": reason,
+            "repo_root": "/tmp/repo" if available else "",
+            "head": "abc123" if available else "",
+            "status": status or [],
+        }
+
+    def write_worker_run(
+        self,
+        root,
+        name,
+        metadata=None,
+        stdout="",
+        stderr="",
+        exit_code="0\n",
+        summary="summary\n",
+    ):
+        run_dir = Path(root) / name
+        run_dir.mkdir(parents=True)
+        if metadata is not None:
+            (run_dir / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+        (run_dir / "stdout.txt").write_text(stdout, encoding="utf-8")
+        (run_dir / "stderr.txt").write_text(stderr, encoding="utf-8")
+        (run_dir / "exit_code.txt").write_text(exit_code, encoding="utf-8")
+        (run_dir / "summary.txt").write_text(summary, encoding="utf-8")
+        return run_dir
+
     def test_generate_zai_jwt_from_raw_key(self):
         token, exp = self.mod.generate_zai_jwt("test-api-id.test-secret", ttl_seconds=60)
 
@@ -452,10 +481,11 @@ class GlmRelayWrapperTests(unittest.TestCase):
             }
             with mock.patch.dict(os.environ, env_patch):
                 with mock.patch.object(self.mod, "worker_preflight", return_value=("/bin/codex", tmp_path, tmp_path / "codex-home")):
-                    with mock.patch.object(self.mod.subprocess, "run", fake_run):
-                        with mock.patch.object(self.mod, "relay_is_running", return_value=1234):
-                            with contextlib.redirect_stdout(io.StringIO()) as stdout:
-                                code = self.mod.run_worker(args)
+                    with mock.patch.object(self.mod, "git_context", return_value=self.git_snapshot()):
+                        with mock.patch.object(self.mod.subprocess, "run", fake_run):
+                            with mock.patch.object(self.mod, "relay_is_running", return_value=1234):
+                                with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                                    code = self.mod.run_worker(args)
 
             run_dirs = list((self.mod.WORKER_RUNS).iterdir())
             self.assertEqual(code, 0)
@@ -466,6 +496,10 @@ class GlmRelayWrapperTests(unittest.TestCase):
             self.assertEqual((run_dir / "stdout.txt").read_text(encoding="utf-8"), "ok\n")
             self.assertEqual(metadata["pid"], 1234)
             self.assertEqual(metadata["argv"][-1], "<redacted-task-prompt>")
+            self.assertIn("git", metadata)
+            self.assertIn("before", metadata["git"])
+            self.assertIn("after", metadata["git"])
+            self.assertEqual(metadata["git"]["changed_files"], [])
             self.assertNotIn(task, json.dumps(metadata))
             self.assertEqual(captured["argv"][-1], task)
             self.assertEqual(captured["env"]["CODEX_HOME"], str(tmp_path / "codex-home"))
@@ -497,14 +531,15 @@ class GlmRelayWrapperTests(unittest.TestCase):
             )
 
             with mock.patch.object(self.mod, "worker_preflight", return_value=("/bin/codex", tmp_path, tmp_path / "codex-home")):
-                with mock.patch.object(
-                    self.mod.subprocess,
-                    "run",
-                    return_value=subprocess.CompletedProcess(["codex"], 0, "", ""),
-                ):
-                    with mock.patch.object(self.mod, "relay_is_running", return_value=None):
-                        with contextlib.redirect_stdout(io.StringIO()) as stdout:
-                            code = self.mod.run_worker(args)
+                with mock.patch.object(self.mod, "git_context", return_value=self.git_snapshot()):
+                    with mock.patch.object(
+                        self.mod.subprocess,
+                        "run",
+                        return_value=subprocess.CompletedProcess(["codex"], 0, "", ""),
+                    ):
+                        with mock.patch.object(self.mod, "relay_is_running", return_value=None):
+                            with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                                code = self.mod.run_worker(args)
 
             run_dirs = list((self.mod.WORKER_RUNS).iterdir())
             self.assertEqual(code, 0)
@@ -537,13 +572,14 @@ class GlmRelayWrapperTests(unittest.TestCase):
             )
 
             with mock.patch.object(self.mod, "worker_preflight", return_value=("/bin/codex", tmp_path, tmp_path / "codex-home")):
-                with mock.patch.object(
-                    self.mod.subprocess,
-                    "run",
-                    return_value=subprocess.CompletedProcess(["codex"], 7, "", "bad\n"),
-                ):
-                    with contextlib.redirect_stdout(io.StringIO()):
-                        code = self.mod.run_worker(args)
+                with mock.patch.object(self.mod, "git_context", return_value=self.git_snapshot()):
+                    with mock.patch.object(
+                        self.mod.subprocess,
+                        "run",
+                        return_value=subprocess.CompletedProcess(["codex"], 7, "", "bad\n"),
+                    ):
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            code = self.mod.run_worker(args)
 
             run_dir = next(self.mod.WORKER_RUNS.iterdir())
             self.assertEqual(code, 7)
@@ -571,9 +607,10 @@ class GlmRelayWrapperTests(unittest.TestCase):
             )
 
             with mock.patch.object(self.mod, "worker_preflight", side_effect=SystemExit("codex CLI not found")):
-                with mock.patch.object(self.mod.subprocess, "run") as run:
-                    with contextlib.redirect_stdout(io.StringIO()):
-                        code = self.mod.run_worker(args)
+                with mock.patch.object(self.mod, "git_context", return_value=self.git_snapshot()):
+                    with mock.patch.object(self.mod.subprocess, "run") as run:
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            code = self.mod.run_worker(args)
 
             run.assert_not_called()
             run_dir = next(self.mod.WORKER_RUNS.iterdir())
@@ -607,9 +644,10 @@ class GlmRelayWrapperTests(unittest.TestCase):
                 raise subprocess.TimeoutExpired(cmd=["codex"], timeout=1.0, output=b"partial\n", stderr=b"slow\n")
 
             with mock.patch.object(self.mod, "worker_preflight", return_value=("/bin/codex", tmp_path, tmp_path / "codex-home")):
-                with mock.patch.object(self.mod.subprocess, "run", raise_timeout):
-                    with contextlib.redirect_stdout(io.StringIO()):
-                        code = self.mod.run_worker(args)
+                with mock.patch.object(self.mod, "git_context", return_value=self.git_snapshot()):
+                    with mock.patch.object(self.mod.subprocess, "run", raise_timeout):
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            code = self.mod.run_worker(args)
 
             run_dir = next(self.mod.WORKER_RUNS.iterdir())
             metadata = json.loads((run_dir / "metadata.json").read_text(encoding="utf-8"))
@@ -617,6 +655,235 @@ class GlmRelayWrapperTests(unittest.TestCase):
             self.assertEqual(metadata["error"], "worker timed out after 1.0s")
             self.assertEqual((run_dir / "stdout.txt").read_text(encoding="utf-8"), "partial\n")
             self.assertEqual((run_dir / "stderr.txt").read_text(encoding="utf-8"), "slow\n")
+
+    def test_git_context_captures_status_and_head(self):
+        calls = []
+
+        def fake_git(argv, text, capture_output, timeout):
+            calls.append(argv)
+            if argv[-1] == "--show-toplevel":
+                return subprocess.CompletedProcess(argv, 0, "/tmp/repo\n", "")
+            if argv[-1] == "HEAD":
+                return subprocess.CompletedProcess(argv, 0, "abc123\n", "")
+            return subprocess.CompletedProcess(argv, 0, " M README.md\n?? notes.txt\n", "")
+
+        with mock.patch.object(self.mod.subprocess, "run", fake_git):
+            snapshot = self.mod.git_context(Path("/tmp"))
+
+        self.assertTrue(snapshot["available"])
+        self.assertEqual(snapshot["repo_root"], "/tmp/repo")
+        self.assertEqual(snapshot["head"], "abc123")
+        self.assertEqual(
+            snapshot["status"],
+            [
+                {"status": "M", "path": "README.md"},
+                {"status": "??", "path": "notes.txt"},
+            ],
+        )
+        self.assertEqual(len(calls), 3)
+
+    def test_git_context_fails_softly_outside_repo(self):
+        def fake_git(argv, text, capture_output, timeout):
+            return subprocess.CompletedProcess(argv, 128, "", "not a git repository")
+
+        with mock.patch.object(self.mod.subprocess, "run", fake_git):
+            snapshot = self.mod.git_context(Path("/tmp"))
+
+        self.assertFalse(snapshot["available"])
+        self.assertIn("not a git repository", snapshot["reason"])
+        self.assertEqual(snapshot["status"], [])
+
+    def test_git_status_delta_distinguishes_file_states(self):
+        before = self.git_snapshot(status=[
+            {"status": "M", "path": "preexisting.txt"},
+            {"status": "A", "path": "cleaned.txt"},
+            {"status": "M", "path": "changed.txt"},
+        ])
+        after = self.git_snapshot(status=[
+            {"status": "M", "path": "preexisting.txt"},
+            {"status": "MM", "path": "changed.txt"},
+            {"status": "??", "path": "new.txt"},
+        ])
+
+        delta = self.mod.git_status_delta(before, after)
+
+        self.assertEqual(
+            delta,
+            [
+                {
+                    "path": "changed.txt",
+                    "before_status": "M",
+                    "after_status": "MM",
+                    "change": "changed",
+                },
+                {
+                    "path": "cleaned.txt",
+                    "before_status": "A",
+                    "after_status": "",
+                    "change": "cleaned",
+                },
+                {
+                    "path": "new.txt",
+                    "before_status": "",
+                    "after_status": "??",
+                    "change": "new",
+                },
+                {
+                    "path": "preexisting.txt",
+                    "before_status": "M",
+                    "after_status": "M",
+                    "change": "preexisting",
+                },
+            ],
+        )
+
+    def test_resolve_worker_run_latest_and_named(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.mod.WORKER_RUNS = Path(tmp) / "runs"
+            older = self.write_worker_run(self.mod.WORKER_RUNS, "20260707-000001-old")
+            newer = self.write_worker_run(self.mod.WORKER_RUNS, "20260707-000002-new")
+            os.utime(older, (1, 1))
+            os.utime(newer, (2, 2))
+
+            self.assertEqual(self.mod.resolve_worker_run("latest"), newer)
+            self.assertEqual(self.mod.resolve_worker_run(older.name), older.resolve())
+            self.assertEqual(self.mod.resolve_worker_run(str(newer)), newer.resolve())
+
+    def test_resolve_worker_run_errors_when_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.mod.WORKER_RUNS = Path(tmp) / "runs"
+
+            with self.assertRaises(SystemExit) as caught:
+                self.mod.resolve_worker_run("latest")
+
+        self.assertIn("no worker runs found", str(caught.exception))
+
+    def test_load_worker_run_tolerates_malformed_and_missing_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.mod.WORKER_RUNS = Path(tmp) / "runs"
+            run_dir = self.mod.WORKER_RUNS / "partial"
+            run_dir.mkdir(parents=True)
+            (run_dir / "metadata.json").write_text("{not json", encoding="utf-8")
+            (run_dir / "stderr.txt").write_text("bad\n", encoding="utf-8")
+            (run_dir / "exit_code.txt").write_text("7\n", encoding="utf-8")
+
+            bundle = self.mod.load_worker_run("partial")
+            review = self.mod.build_worker_review(bundle)
+
+        self.assertEqual(review["exit_code"], 7)
+        self.assertEqual(review["status"], "failed")
+        self.assertIn("bad", review["stderr_tail"])
+        self.assertTrue(any("malformed JSON" in warning for warning in review["warnings"]))
+        self.assertTrue(any("missing artifact: stdout.txt" in warning for warning in review["warnings"]))
+
+    def test_review_worker_human_output_is_read_only_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.mod.WORKER_RUNS = Path(tmp) / "runs"
+            metadata = {
+                "model": "glm-5.2",
+                "cwd": str(Path(tmp)),
+                "elapsed_seconds": 1.25,
+                "pid": 1234,
+                "exit_code": 0,
+                "argv": ["codex", "exec", "secret prompt"],
+                "git": {
+                    "before": self.git_snapshot(status=[]),
+                    "after": self.git_snapshot(status=[{"status": "M", "path": "README.md"}]),
+                    "changed_files": [
+                        {
+                            "path": "README.md",
+                            "before_status": "",
+                            "after_status": "M",
+                            "change": "new",
+                        }
+                    ],
+                },
+            }
+            self.write_worker_run(
+                self.mod.WORKER_RUNS,
+                "review-me",
+                metadata=metadata,
+                stdout="\n".join(f"out {i}" for i in range(6)),
+            )
+            args = argparse.Namespace(
+                target="review-me",
+                json_output=False,
+                stdout_lines=2,
+                stderr_lines=2,
+            )
+
+            with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                code = self.mod.review_worker(args)
+
+        text = stdout.getvalue()
+        self.assertEqual(code, 0)
+        self.assertIn("worker review: passed exit_code=0", text)
+        self.assertIn("README.md", text)
+        self.assertIn("out 4", text)
+        self.assertIn("out 5", text)
+        self.assertNotIn("out 3", text)
+        self.assertNotIn("secret prompt", text)
+        self.assertIn("inspect the actual git diff", text)
+
+    def test_review_worker_json_output_is_parseable_and_redacted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.mod.WORKER_RUNS = Path(tmp) / "runs"
+            metadata = {
+                "model": "glm-5.2",
+                "cwd": str(Path(tmp)),
+                "exit_code": 0,
+                "argv": ["codex", "exec", "raw task text"],
+                "git": {
+                    "before": self.git_snapshot(status=[]),
+                    "after": self.git_snapshot(status=[{"status": "M", "path": "work/glm-relay"}]),
+                },
+            }
+            self.write_worker_run(
+                self.mod.WORKER_RUNS,
+                "json-me",
+                metadata=metadata,
+                stdout="ok\n",
+            )
+            args = argparse.Namespace(
+                target="json-me",
+                json_output=True,
+                stdout_lines=5,
+                stderr_lines=5,
+            )
+
+            with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                code = self.mod.review_worker(args)
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["status"], "passed")
+        self.assertEqual(payload["metadata"]["argv"][-1], "<redacted-task-prompt>")
+        self.assertNotIn("raw task text", stdout.getvalue())
+        self.assertEqual(payload["changed_files"][0]["path"], "work/glm-relay")
+        self.assertEqual(payload["stdout_tail"], ["ok"])
+
+    def test_review_warns_when_empty_delta_came_from_unavailable_git_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.mod.WORKER_RUNS = Path(tmp) / "runs"
+            metadata = {
+                "exit_code": 0,
+                "git": {
+                    "before": self.git_snapshot(available=False, reason="not a git repository"),
+                    "after": self.git_snapshot(available=False, reason="not a git repository"),
+                    "changed_files": [],
+                },
+            }
+            self.write_worker_run(
+                self.mod.WORKER_RUNS,
+                "no-git",
+                metadata=metadata,
+            )
+
+            bundle = self.mod.load_worker_run("no-git")
+            review = self.mod.build_worker_review(bundle)
+
+        self.assertEqual(review["changed_files"], [])
+        self.assertTrue(any("git context unavailable" in warning for warning in review["warnings"]))
 
     def test_run_worker_parser_accepts_task_and_common_args(self):
         parser = argparse.ArgumentParser()
@@ -638,6 +905,25 @@ class GlmRelayWrapperTests(unittest.TestCase):
         self.assertEqual(args.task, "Do the work")
         self.assertEqual(args.codex_profile, "glm52-relay")
         self.assertEqual(args.codex_home, "~/.codex")
+
+    def test_review_worker_parser_accepts_defaults_target_and_json(self):
+        parser = argparse.ArgumentParser()
+        sub = parser.add_subparsers(dest="command", required=True)
+        p = sub.add_parser("review-worker")
+        p.add_argument("target", nargs="?", default="latest")
+        p.add_argument("--json", action="store_true", dest="json_output")
+        p.add_argument("--stdout-lines", type=int, default=self.mod.DEFAULT_REVIEW_TAIL_LINES)
+        p.add_argument("--stderr-lines", type=int, default=self.mod.DEFAULT_REVIEW_TAIL_LINES)
+        p.set_defaults(func=self.mod.review_worker)
+
+        default_args = parser.parse_args(["review-worker"])
+        json_args = parser.parse_args(["review-worker", "run-name", "--json", "--stdout-lines", "3"])
+
+        self.assertEqual(default_args.target, "latest")
+        self.assertFalse(default_args.json_output)
+        self.assertEqual(json_args.target, "run-name")
+        self.assertTrue(json_args.json_output)
+        self.assertEqual(json_args.stdout_lines, 3)
 
 
 if __name__ == "__main__":
