@@ -32,6 +32,8 @@ DEFAULT_MODEL = "glm-5.2"
 DEFAULT_CODEX_PROFILE = "glm52-relay"
 DEFAULT_CODEX_HOME = "~/.codex"
 DEFAULT_REFRESH_MARGIN_SECONDS = 5 * 60
+DEFAULT_REVIEW_TAIL_LINES = 20
+GIT_COMMAND_TIMEOUT_SECONDS = 5.0
 DEFAULT_TOOL_DENYLIST = ",".join([
     "spawn_agent",
     "wait_agent",
@@ -169,9 +171,350 @@ def worker_summary(metadata, run_dir):
         f"worker {status}: exit_code={metadata['exit_code']}",
         f"elapsed_seconds={metadata['elapsed_seconds']:.2f}",
         f"artifacts={run_dir}",
-        "review: inspect stdout.txt, stderr.txt, metadata.json, and git diff before trusting GLM output",
+        "review: run work/glm-relay review-worker latest, then inspect git diff and tests before trusting GLM output",
         "",
     ])
+
+
+def git_command(cwd, *args):
+    return subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        text=True,
+        capture_output=True,
+        timeout=GIT_COMMAND_TIMEOUT_SECONDS,
+    )
+
+
+def unavailable_git_context(reason):
+    return {
+        "available": False,
+        "reason": as_text(reason).strip()[:500],
+        "repo_root": "",
+        "head": "",
+        "status": [],
+    }
+
+
+def parse_git_status_lines(text):
+    entries = []
+    for line in as_text(text).splitlines():
+        if not line:
+            continue
+        status = line[:2].strip() or line[:2]
+        path = line[3:] if len(line) > 3 else ""
+        entries.append({"status": status, "path": path})
+    return entries
+
+
+def git_context(cwd):
+    cwd = Path(cwd)
+    if not cwd.exists() or not cwd.is_dir():
+        return unavailable_git_context(f"cwd is not a directory: {cwd}")
+
+    try:
+        root = git_command(cwd, "rev-parse", "--show-toplevel")
+        if root.returncode != 0:
+            return unavailable_git_context(root.stderr or root.stdout or "not a git repository")
+        head = git_command(cwd, "rev-parse", "HEAD")
+        status = git_command(cwd, "status", "--porcelain=v1")
+    except FileNotFoundError:
+        return unavailable_git_context("git binary not found")
+    except subprocess.TimeoutExpired as exc:
+        return unavailable_git_context(f"git command timed out after {exc.timeout}s")
+    except Exception as exc:
+        return unavailable_git_context(exc)
+
+    if head.returncode != 0:
+        return unavailable_git_context(head.stderr or head.stdout or "cannot resolve git HEAD")
+    if status.returncode != 0:
+        return unavailable_git_context(status.stderr or status.stdout or "cannot read git status")
+
+    return {
+        "available": True,
+        "reason": "",
+        "repo_root": root.stdout.strip(),
+        "head": head.stdout.strip(),
+        "status": parse_git_status_lines(status.stdout),
+    }
+
+
+def git_status_map(snapshot):
+    return {
+        entry.get("path", ""): entry.get("status", "")
+        for entry in snapshot.get("status", [])
+        if entry.get("path")
+    }
+
+
+def git_status_delta(before, after):
+    if not before.get("available") or not after.get("available"):
+        return []
+
+    before_status = git_status_map(before)
+    after_status = git_status_map(after)
+    changed = []
+    for path in sorted(set(before_status) | set(after_status)):
+        before_value = before_status.get(path, "")
+        after_value = after_status.get(path, "")
+        if before_value == after_value and after_value:
+            change = "preexisting"
+        elif before_value and not after_value:
+            change = "cleaned"
+        elif after_value and not before_value:
+            change = "new"
+        else:
+            change = "changed"
+        changed.append({
+            "path": path,
+            "before_status": before_value,
+            "after_status": after_value,
+            "change": change,
+        })
+    return changed
+
+
+def worker_run_dirs():
+    if not WORKER_RUNS.exists():
+        return []
+    return sorted(
+        [path for path in WORKER_RUNS.iterdir() if path.is_dir()],
+        key=lambda path: (path.stat().st_mtime, path.name),
+    )
+
+
+def resolve_worker_run(target):
+    target = target or "latest"
+    if target == "latest":
+        runs = worker_run_dirs()
+        if not runs:
+            raise SystemExit(f"no worker runs found under {WORKER_RUNS}")
+        return runs[-1]
+
+    explicit = Path(target).expanduser()
+    candidates = []
+    if explicit.exists():
+        candidates.append(explicit)
+    if not explicit.is_absolute():
+        candidates.append(WORKER_RUNS / target)
+        candidates.extend(run for run in worker_run_dirs() if run.name == target)
+
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_dir():
+            return candidate.resolve()
+        if candidate.exists():
+            raise SystemExit(f"worker run target is not a directory: {candidate}")
+
+    raise SystemExit(f"worker run not found: {target}")
+
+
+def read_artifact_text(path, warnings):
+    if not path.exists():
+        warnings.append(f"missing artifact: {path.name}")
+        return ""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        warnings.append(f"cannot read {path.name}: {exc}")
+        return ""
+
+
+def read_artifact_json(path, warnings):
+    text = read_artifact_text(path, warnings)
+    if not text:
+        return {}
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        warnings.append(f"malformed JSON in {path.name}: {exc}")
+        return {}
+    if not isinstance(payload, dict):
+        warnings.append(f"unexpected JSON shape in {path.name}: expected object")
+        return {}
+    return payload
+
+
+def load_worker_run(target):
+    run_dir = resolve_worker_run(target)
+    warnings = []
+    metadata = read_artifact_json(run_dir / "metadata.json", warnings)
+    stdout = read_artifact_text(run_dir / "stdout.txt", warnings)
+    stderr = read_artifact_text(run_dir / "stderr.txt", warnings)
+    exit_code_text = read_artifact_text(run_dir / "exit_code.txt", warnings)
+    summary = read_artifact_text(run_dir / "summary.txt", warnings)
+    return {
+        "run_dir": run_dir,
+        "metadata": metadata,
+        "stdout": stdout,
+        "stderr": stderr,
+        "exit_code_text": exit_code_text,
+        "summary": summary,
+        "warnings": warnings,
+    }
+
+
+def parse_exit_code(bundle, warnings):
+    metadata_exit = bundle["metadata"].get("exit_code")
+    if isinstance(metadata_exit, int):
+        return metadata_exit
+    try:
+        return int(bundle["exit_code_text"].strip())
+    except (TypeError, ValueError):
+        warnings.append("missing or invalid exit code")
+        return None
+
+
+def safe_review_metadata(metadata):
+    allowed = [
+        "model",
+        "codex_profile",
+        "codex_home",
+        "profile_output",
+        "cwd",
+        "port",
+        "pid",
+        "started_at",
+        "ended_at",
+        "elapsed_seconds",
+        "argv",
+        "exit_code",
+        "error",
+        "relay_log",
+        "tool_denylist",
+        "git",
+    ]
+    safe = {key: metadata[key] for key in allowed if key in metadata}
+    argv = safe.get("argv")
+    if isinstance(argv, list) and argv:
+        safe["argv"] = list(argv[:-1]) + ["<redacted-task-prompt>"]
+    return safe
+
+
+def tail_lines(text, limit):
+    if limit <= 0:
+        return []
+    lines = as_text(text).splitlines()
+    if len(lines) <= limit:
+        return lines
+    return lines[-limit:]
+
+
+def changed_files_from_metadata(metadata, warnings):
+    git = metadata.get("git")
+    if not isinstance(git, dict):
+        warnings.append("metadata has no git context; changed files unknown")
+        return []
+
+    before = git.get("before")
+    after = git.get("after")
+    changed = git.get("changed_files")
+    if isinstance(changed, list):
+        if changed:
+            return changed
+        if isinstance(before, dict) and isinstance(after, dict):
+            if before.get("available") and after.get("available"):
+                return []
+            reason = after.get("reason") or before.get("reason") or "git context unavailable"
+            warnings.append(f"git context unavailable: {reason}")
+            return []
+        warnings.append("metadata git context is incomplete; changed files unknown")
+        return []
+
+    if isinstance(before, dict) and isinstance(after, dict):
+        delta = git_status_delta(before, after)
+        if delta:
+            return delta
+        if before.get("available") and after.get("available"):
+            return []
+        reason = after.get("reason") or before.get("reason") or "git context unavailable"
+        warnings.append(f"git context unavailable: {reason}")
+        return []
+
+    warnings.append("metadata git context is incomplete; changed files unknown")
+    return []
+
+
+def build_worker_review(bundle, stdout_lines=DEFAULT_REVIEW_TAIL_LINES, stderr_lines=DEFAULT_REVIEW_TAIL_LINES):
+    warnings = list(bundle["warnings"])
+    metadata = safe_review_metadata(bundle["metadata"])
+    exit_code = parse_exit_code(bundle, warnings)
+    changed_files = changed_files_from_metadata(metadata, warnings)
+    status = "unknown"
+    if exit_code is not None:
+        status = "passed" if exit_code == 0 else "failed"
+
+    return {
+        "run_dir": str(bundle["run_dir"]),
+        "status": status,
+        "exit_code": exit_code,
+        "model": metadata.get("model", ""),
+        "elapsed_seconds": metadata.get("elapsed_seconds"),
+        "cwd": metadata.get("cwd", ""),
+        "relay_pid": metadata.get("pid"),
+        "metadata": metadata,
+        "changed_files": changed_files,
+        "warnings": warnings,
+        "stdout_tail": tail_lines(bundle["stdout"], stdout_lines),
+        "stderr_tail": tail_lines(bundle["stderr"], stderr_lines),
+    }
+
+
+def format_changed_file(change):
+    if isinstance(change, str):
+        return change
+    path = change.get("path", "")
+    label = change.get("change", "changed")
+    before = change.get("before_status", "")
+    after = change.get("after_status", "")
+    status = f"{before or '-'} -> {after or '-'}"
+    return f"{path} ({label}, {status})"
+
+
+def format_worker_review(review):
+    exit_code = "unknown" if review["exit_code"] is None else str(review["exit_code"])
+    lines = [
+        f"worker review: {review['status']} exit_code={exit_code}",
+        f"artifacts={review['run_dir']}",
+        f"model={review['model'] or 'unknown'}",
+        f"elapsed_seconds={review['elapsed_seconds'] if review['elapsed_seconds'] is not None else 'unknown'}",
+        f"cwd={review['cwd'] or 'unknown'}",
+        f"relay_pid={review['relay_pid'] if review['relay_pid'] is not None else 'unknown'}",
+    ]
+
+    if review["changed_files"]:
+        lines.append("changed_files:")
+        lines.extend(f"  - {format_changed_file(change)}" for change in review["changed_files"])
+    else:
+        lines.append("changed_files=unknown_or_none")
+
+    if review["warnings"]:
+        lines.append("warnings:")
+        lines.extend(f"  - {warning}" for warning in review["warnings"])
+
+    if review["stdout_tail"]:
+        lines.append("stdout_tail:")
+        lines.extend(f"  {line}" for line in review["stdout_tail"])
+
+    if review["stderr_tail"]:
+        lines.append("stderr_tail:")
+        lines.extend(f"  {line}" for line in review["stderr_tail"])
+
+    lines.append("review: inspect the actual git diff and relevant tests before trusting GLM output")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def review_worker(args):
+    bundle = load_worker_run(args.target)
+    review = build_worker_review(
+        bundle,
+        stdout_lines=args.stdout_lines,
+        stderr_lines=args.stderr_lines,
+    )
+    if args.json_output:
+        print(json.dumps(review, indent=2, sort_keys=True))
+    else:
+        print(format_worker_review(review), end="")
+    return 0
 
 
 def worker_env(codex_home):
@@ -619,8 +962,12 @@ def run_worker(args):
     exit_code = 1
     redacted_argv = []
     error = ""
+    git_before = unavailable_git_context("not captured")
+    git_after = unavailable_git_context("not captured")
 
     try:
+        if worker_cwd.exists():
+            git_before = git_context(worker_cwd)
         codex_bin, worker_cwd, codex_home = worker_preflight(args)
         argv = [
             codex_bin,
@@ -655,6 +1002,9 @@ def run_worker(args):
     finally:
         ended_at = time.time()
         state = load_state()
+        if worker_cwd.exists():
+            git_after = git_context(worker_cwd)
+        git_changed = git_status_delta(git_before, git_after)
         metadata = {
             "model": args.model,
             "codex_profile": args.codex_profile,
@@ -671,6 +1021,11 @@ def run_worker(args):
             "error": error,
             "relay_log": state.get("log_file", str(LOG_FILE)),
             "tool_denylist": args.tool_denylist,
+            "git": {
+                "before": git_before,
+                "after": git_after,
+                "changed_files": git_changed,
+            },
         }
         write_worker_text(run_dir / "stdout.txt", stdout)
         write_worker_text(run_dir / "stderr.txt", stderr)
@@ -776,6 +1131,13 @@ def main():
     p.add_argument("--codex-profile", default=DEFAULT_CODEX_PROFILE)
     p.add_argument("--codex-home", default=os.environ.get("CODEX_HOME", DEFAULT_CODEX_HOME))
     p.set_defaults(func=run_worker)
+
+    p = sub.add_parser("review-worker", help="Review a GLM worker artifact bundle")
+    p.add_argument("target", nargs="?", default="latest", help="Worker run name, path, or latest")
+    p.add_argument("--json", action="store_true", dest="json_output", help="Emit a machine-readable summary")
+    p.add_argument("--stdout-lines", type=int, default=DEFAULT_REVIEW_TAIL_LINES)
+    p.add_argument("--stderr-lines", type=int, default=DEFAULT_REVIEW_TAIL_LINES)
+    p.set_defaults(func=review_worker)
 
     p = sub.add_parser("logs", help="Show recent relay logs")
     p.add_argument("--lines", type=int, default=80)

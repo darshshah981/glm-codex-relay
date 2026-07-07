@@ -119,6 +119,7 @@ implementation attempt:
 ```bash
 export ZAI_RAW_KEY="paste-your-zai-raw-key-here"
 work/glm-relay run-worker "Implement the focused task described here"
+work/glm-relay review-worker latest
 ```
 
 `run-worker` refreshes or starts the relay, writes
@@ -138,9 +139,24 @@ outputs/glm-worker-runs/<timestamp>-<label>/
   summary.txt
 ```
 
-`metadata.json` stores non-secret runtime facts and redacts the task prompt
-from the captured argv. Review the bundle, the git diff, and the relevant tests
-before trusting the GLM worker result.
+`metadata.json` stores non-secret runtime facts, redacts the task prompt from
+the captured argv, and records git status snapshots before and after the worker
+attempt when the worker cwd is inside a git repository.
+
+Use `review-worker` to inspect a run without restarting the relay or calling
+Z.ai:
+
+```bash
+work/glm-relay review-worker latest
+work/glm-relay review-worker <run-directory-name>
+work/glm-relay review-worker latest --json
+```
+
+The review command is read-only. It summarizes exit code, model, elapsed time,
+cwd, artifact path, relay pid, changed files when available, and bounded
+stdout/stderr tails. It does not accept, revert, delete, or test changes. Review
+the bundle, the actual git diff, and the relevant tests before trusting the GLM
+worker result.
 
 ## Auth refresh
 

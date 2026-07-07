@@ -163,6 +163,7 @@ you want GLM-5.2 to attempt the implementation through the local relay:
 ```bash
 export ZAI_RAW_KEY="paste-your-zai-raw-key-here"
 work/glm-relay run-worker "Make the focused change described here"
+work/glm-relay review-worker latest
 ```
 
 The command prepares the relay/profile path, launches:
@@ -180,9 +181,24 @@ outputs/glm-worker-runs/
 ```
 
 Each run stores the task prompt, stdout, stderr, exit code, redacted metadata,
-and a short summary. Treat the bundle as local sensitive data: it can contain
-prompts, tool output, and repo context. Codex should review the worker output,
-git diff, and tests before trusting or shipping GLM's changes.
+git context before/after the attempt, and a short summary. Treat the bundle as
+local sensitive data: it can contain prompts, tool output, and repo context.
+
+Use `review-worker` to summarize the latest or a selected run without making
+another provider call:
+
+```bash
+work/glm-relay review-worker latest
+work/glm-relay review-worker <run-directory-name>
+work/glm-relay review-worker latest --json
+```
+
+The review command is read-only. It reports the worker exit code, model,
+elapsed time, cwd, artifact path, relay pid when known, changed files from the
+captured git snapshots, and bounded stdout/stderr tails. It does not accept,
+revert, delete, or test the worker changes for you. Codex should review the
+worker output, inspect the actual git diff, and run relevant tests before
+trusting or shipping GLM's changes.
 Test this lane first with documentation-only tasks before trusting it for code changes.
 
 ## Tool policy
