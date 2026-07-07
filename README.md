@@ -155,6 +155,36 @@ work/glm-relay live-smoke --include-tool-call
 The tool-call check is stricter and more provider-behavior-sensitive, so keep
 the text smoke as the first live gate.
 
+## GLM worker lane
+
+Use `run-worker` when the main Codex session has planned a bounded task and
+you want GLM-5.2 to attempt the implementation through the local relay:
+
+```bash
+export ZAI_RAW_KEY="paste-your-zai-raw-key-here"
+work/glm-relay run-worker "Make the focused change described here"
+```
+
+The command prepares the relay/profile path, launches:
+
+```text
+codex --profile glm52-relay exec <task>
+```
+
+It writes the profile to `$CODEX_HOME/glm52-relay.config.toml`, defaulting to
+`~/.codex/glm52-relay.config.toml`, and passes that same `CODEX_HOME` to the
+worker process. It saves a review bundle under:
+
+```text
+outputs/glm-worker-runs/
+```
+
+Each run stores the task prompt, stdout, stderr, exit code, redacted metadata,
+and a short summary. Treat the bundle as local sensitive data: it can contain
+prompts, tool output, and repo context. Codex should review the worker output,
+git diff, and tests before trusting or shipping GLM's changes.
+Test this lane first with documentation-only tasks before trusting it for code changes.
+
 ## Tool policy
 
 By default, v1 hides Codex subagent / multi-agent runtime tools from GLM:
@@ -179,4 +209,5 @@ state. Treat it as sensitive:
 
 ```text
 work/.glm-relay/history/
+outputs/glm-worker-runs/
 ```

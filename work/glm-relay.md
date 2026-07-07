@@ -111,6 +111,37 @@ Use the stricter optional tool-call check after the text smoke passes:
 work/glm-relay live-smoke --include-tool-call
 ```
 
+## Worker lane
+
+The worker lane keeps Codex as planner/reviewer and uses GLM for one bounded
+implementation attempt:
+
+```bash
+export ZAI_RAW_KEY="paste-your-zai-raw-key-here"
+work/glm-relay run-worker "Implement the focused task described here"
+```
+
+`run-worker` refreshes or starts the relay, writes
+`$CODEX_HOME/glm52-relay.config.toml`, and invokes Codex CLI with that profile
+and the same `CODEX_HOME`. It does not run `live-smoke` first by default,
+because the worker run itself is already a live provider call.
+
+Each attempt writes a local review bundle:
+
+```text
+outputs/glm-worker-runs/<timestamp>-<label>/
+  prompt.txt
+  metadata.json
+  stdout.txt
+  stderr.txt
+  exit_code.txt
+  summary.txt
+```
+
+`metadata.json` stores non-secret runtime facts and redacts the task prompt
+from the captured argv. Review the bundle, the git diff, and the relevant tests
+before trusting the GLM worker result.
+
 ## Auth refresh
 
 Z.ai uses a generated JWT. The wrapper generates a fresh JWT when the relay
@@ -134,6 +165,7 @@ state. Treat this directory as sensitive:
 
 ```text
 work/.glm-relay/history/
+outputs/glm-worker-runs/
 ```
 
 ## Tool policy
@@ -164,5 +196,6 @@ work/.venv/                    local codex-relay install
 work/.glm-relay/relay.pid      relay pid
 work/.glm-relay/state.json     non-secret state
 work/.glm-relay/history/       optional disk-backed relay history
+outputs/glm-worker-runs/       local GLM worker review bundles
 outputs/glm-relay.log          relay logs
 ```
