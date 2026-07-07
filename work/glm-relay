@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -330,6 +331,19 @@ def post_json(url, payload, timeout):
         raise SystemExit(f"live smoke failed: relay returned non-JSON: {exc}") from exc
 
 
+def wait_for_local_port(port, timeout):
+    deadline = time.time() + timeout
+    last_error = None
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                return
+        except OSError as exc:
+            last_error = exc
+            time.sleep(0.1)
+    raise SystemExit(f"live smoke failed: relay did not open port {port}: {last_error}")
+
+
 def extract_output_text(response):
     texts = []
     for item in response.get("output", []):
@@ -356,7 +370,7 @@ def text_smoke_payload(model):
         "input": "Reply with exactly: GLM_SMOKE_OK",
         "stream": False,
         "temperature": 0,
-        "max_output_tokens": 64,
+        "max_output_tokens": 512,
     }
 
 
@@ -388,7 +402,7 @@ def tool_smoke_payload(model):
         ],
         "stream": False,
         "temperature": 0,
-        "max_output_tokens": 128,
+        "max_output_tokens": 512,
     }
 
 
@@ -406,6 +420,7 @@ def live_smoke(args):
         start_args.history_store = "memory"
         start_relay(start_args)
         started_by_smoke = True
+        wait_for_local_port(args.port, min(args.timeout, 10.0))
     else:
         print(f"using running relay pid={pid}")
 

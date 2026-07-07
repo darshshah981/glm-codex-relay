@@ -6,6 +6,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import socket
 import tempfile
 import unittest
 from pathlib import Path
@@ -216,7 +217,7 @@ class GlmRelayWrapperTests(unittest.TestCase):
 
         self.assertEqual(text_payload["model"], "glm-5.2")
         self.assertIs(text_payload["stream"], False)
-        self.assertLessEqual(text_payload["max_output_tokens"], 64)
+        self.assertLessEqual(text_payload["max_output_tokens"], 512)
 
         tool_names = [tool["name"] for tool in tool_payload["tools"]]
         self.assertIn("exec_command", tool_names)
@@ -247,6 +248,17 @@ class GlmRelayWrapperTests(unittest.TestCase):
             self.mod.output_function_calls(response)[0]["name"],
             "exec_command",
         )
+
+    def test_wait_for_local_port_times_out_cleanly(self):
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+
+        with self.assertRaises(SystemExit) as caught:
+            self.mod.wait_for_local_port(port, timeout=0.01)
+
+        self.assertIn("relay did not open port", str(caught.exception))
 
 
 if __name__ == "__main__":
