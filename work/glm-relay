@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -23,10 +24,13 @@ STATE = WORK / ".glm-relay"
 PID_FILE = STATE / "relay.pid"
 STATE_FILE = STATE / "state.json"
 LOG_FILE = OUT / "glm-relay.log"
+WORKER_RUNS = OUT / "glm-worker-runs"
 VENDORED_RELAY = ROOT / "third_party" / "codex-relay"
 DEFAULT_PORT = 4453
 DEFAULT_UPSTREAM = "https://api.z.ai/api/coding/paas/v4"
 DEFAULT_MODEL = "glm-5.2"
+DEFAULT_CODEX_PROFILE = "glm52-relay"
+DEFAULT_CODEX_HOME = "~/.codex"
 DEFAULT_REFRESH_MARGIN_SECONDS = 5 * 60
 DEFAULT_TOOL_DENYLIST = ",".join([
     "spawn_agent",
@@ -101,6 +105,90 @@ def find_relay_binary():
     raise SystemExit(
         "codex-relay binary not found. Run: work/glm-relay install-relay"
     )
+
+
+def find_codex_binary():
+    explicit = os.environ.get("CODEX_BIN")
+    if explicit:
+        path = Path(explicit).expanduser()
+        if path.exists():
+            return str(path)
+        resolved = shutil.which(explicit)
+        if resolved:
+            return resolved
+        raise SystemExit(f"CODEX_BIN is set but not found: {explicit}")
+
+    path = shutil.which("codex")
+    if path:
+        return path
+
+    raise SystemExit("codex CLI not found. Install Codex or set CODEX_BIN.")
+
+
+def safe_slug(text, fallback="worker"):
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    slug = re.sub(r"-{2,}", "-", slug)
+    return (slug or fallback)[:48].strip("-") or fallback
+
+
+def unique_worker_run_dir(task, label=""):
+    ensure_dirs()
+    WORKER_RUNS.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+    base = f"{stamp}-{safe_slug(label or task)}"
+    candidate = WORKER_RUNS / base
+    suffix = 2
+    while candidate.exists():
+        candidate = WORKER_RUNS / f"{base}-{suffix}"
+        suffix += 1
+    candidate.mkdir(parents=True)
+    return candidate
+
+
+def write_json(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def write_worker_text(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(as_text(text), encoding="utf-8")
+
+
+def as_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def worker_summary(metadata, run_dir):
+    status = "passed" if metadata["exit_code"] == 0 else "failed"
+    return "\n".join([
+        f"worker {status}: exit_code={metadata['exit_code']}",
+        f"elapsed_seconds={metadata['elapsed_seconds']:.2f}",
+        f"artifacts={run_dir}",
+        "review: inspect stdout.txt, stderr.txt, metadata.json, and git diff before trusting GLM output",
+        "",
+    ])
+
+
+def worker_env(codex_home):
+    env = os.environ.copy()
+    env["CODEX_HOME"] = str(codex_home)
+    for key in list(env):
+        if key.startswith("ZAI_") or key.startswith("CODEX_RELAY_"):
+            env.pop(key, None)
+    return env
+
+
+def codex_home_path(value):
+    return Path(value).expanduser().resolve()
+
+
+def profile_path_for_codex_home(codex_home, profile_name):
+    return codex_home / f"{profile_name}.config.toml"
 
 
 def pid_from_file():
@@ -196,6 +284,9 @@ def start_relay(args):
         "started_at": int(time.time()),
         "tool_denylist": args.tool_denylist,
         "history_store": args.history_store,
+        "model_map": args.model_map,
+        "upstream_extra_params": args.upstream_extra_params,
+        "drop_upstream_params": args.drop_upstream_params,
     })
     print(f"started codex-relay pid={proc.pid} on http://127.0.0.1:{args.port}/v1")
     print(f"jwt expires at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(exp))}")
@@ -208,6 +299,12 @@ def restart_if_needed(args):
         print("relay not running; starting")
         start_relay(args)
         return
+    mismatches = relay_state_mismatches(state, args)
+    if mismatches:
+        print(f"relay settings changed ({', '.join(mismatches)}); restarting relay")
+        stop_relay()
+        start_relay(args)
+        return
     exp = int(state.get("jwt_expires_at", 0))
     margin = int(state.get("jwt_refresh_margin_seconds", args.refresh_margin_seconds))
     if exp and time.time() < exp - margin:
@@ -217,6 +314,27 @@ def restart_if_needed(args):
     print("jwt near expiry or unknown; restarting relay with fresh token")
     stop_relay()
     start_relay(args)
+
+
+def relay_state_mismatches(state, args):
+    expected = {
+        "port": args.port,
+        "upstream": args.upstream,
+        "model": args.model,
+        "tool_denylist": args.tool_denylist,
+        "history_store": args.history_store,
+        "model_map": args.model_map,
+        "upstream_extra_params": args.upstream_extra_params,
+        "drop_upstream_params": args.drop_upstream_params,
+    }
+    mismatches = []
+    for key, expected_value in expected.items():
+        actual = state.get(key)
+        if actual is None and expected_value == "":
+            actual = ""
+        if actual != expected_value:
+            mismatches.append(key)
+    return mismatches
 
 
 def serve(args):
@@ -295,6 +413,23 @@ input_modalities = ["text"]
     profile_path.parent.mkdir(parents=True, exist_ok=True)
     profile_path.write_text(profile, encoding="utf-8")
     print(profile_path)
+
+
+def worker_preflight(args):
+    codex_bin = find_codex_binary()
+    worker_cwd = Path(args.cwd).expanduser().resolve()
+    codex_home = codex_home_path(args.codex_home)
+    if not worker_cwd.exists() or not worker_cwd.is_dir():
+        raise SystemExit(f"worker cwd is not a directory: {worker_cwd}")
+
+    restart_if_needed(args)
+    wait_for_local_port(args.port, min(args.timeout, 10.0))
+    write_profile(argparse.Namespace(
+        output=str(profile_path_for_codex_home(codex_home, args.codex_profile)),
+        port=args.port,
+        model=args.model,
+    ))
+    return codex_bin, worker_cwd, codex_home
 
 
 def health(args):
@@ -466,6 +601,82 @@ def live_smoke(args):
             print("stopped smoke relay")
 
 
+def run_worker(args):
+    run_dir = unique_worker_run_dir(args.task, args.label)
+    started_at = time.time()
+    write_worker_text(run_dir / "prompt.txt", args.task)
+
+    codex_bin = ""
+    worker_cwd = Path(args.cwd).expanduser().resolve()
+    codex_home = codex_home_path(args.codex_home)
+    stdout = ""
+    stderr = ""
+    exit_code = 1
+    redacted_argv = []
+    error = ""
+
+    try:
+        codex_bin, worker_cwd, codex_home = worker_preflight(args)
+        argv = [
+            codex_bin,
+            "--profile",
+            args.codex_profile,
+            "--cd",
+            str(worker_cwd),
+            "exec",
+            args.task,
+        ]
+        redacted_argv = argv[:-1] + ["<redacted-task-prompt>"]
+        proc = subprocess.run(
+            argv,
+            cwd=str(worker_cwd),
+            env=worker_env(codex_home),
+            text=True,
+            capture_output=True,
+            timeout=args.timeout,
+        )
+        stdout = proc.stdout
+        stderr = proc.stderr
+        exit_code = proc.returncode
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
+        exit_code = 124
+        error = f"worker timed out after {args.timeout}s"
+    except SystemExit as exc:
+        exit_code = int(exc.code) if isinstance(exc.code, int) else 1
+        error = str(exc)
+        stderr = f"{stderr}{error}\n"
+    finally:
+        ended_at = time.time()
+        state = load_state()
+        metadata = {
+            "model": args.model,
+            "codex_profile": args.codex_profile,
+            "codex_home": str(codex_home),
+            "profile_output": str(profile_path_for_codex_home(codex_home, args.codex_profile)),
+            "cwd": str(worker_cwd),
+            "port": int(state.get("port", args.port)),
+            "pid": relay_is_running(),
+            "started_at": int(started_at),
+            "ended_at": int(ended_at),
+            "elapsed_seconds": round(ended_at - started_at, 3),
+            "argv": redacted_argv,
+            "exit_code": exit_code,
+            "error": error,
+            "relay_log": state.get("log_file", str(LOG_FILE)),
+            "tool_denylist": args.tool_denylist,
+        }
+        write_worker_text(run_dir / "stdout.txt", stdout)
+        write_worker_text(run_dir / "stderr.txt", stderr)
+        write_worker_text(run_dir / "exit_code.txt", f"{exit_code}\n")
+        write_json(run_dir / "metadata.json", metadata)
+        summary = worker_summary(metadata, run_dir)
+        write_worker_text(run_dir / "summary.txt", summary)
+        print(summary, end="")
+    return exit_code
+
+
 def logs(args):
     if not LOG_FILE.exists():
         print(f"log not found: {LOG_FILE}")
@@ -550,6 +761,16 @@ def main():
         help="Leave a relay started by the smoke running after the check",
     )
     p.set_defaults(func=live_smoke)
+
+    p = sub.add_parser("run-worker", help="Run one bounded Codex task through GLM-5.2")
+    add_common_start_args(p)
+    p.add_argument("task", help="Bounded worker task prompt for Codex exec")
+    p.add_argument("--label", default="", help="Short label for the worker artifact directory")
+    p.add_argument("--cwd", default=str(ROOT), help="Working directory for the Codex worker")
+    p.add_argument("--timeout", type=float, default=900.0)
+    p.add_argument("--codex-profile", default=DEFAULT_CODEX_PROFILE)
+    p.add_argument("--codex-home", default=os.environ.get("CODEX_HOME", DEFAULT_CODEX_HOME))
+    p.set_defaults(func=run_worker)
 
     p = sub.add_parser("logs", help="Show recent relay logs")
     p.add_argument("--lines", type=int, default=80)
