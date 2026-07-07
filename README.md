@@ -36,7 +36,7 @@ The wrapper does not store the raw Z.ai key or generated JWT. Set the raw key
 only in the shell that starts the relay:
 
 ```bash
-export ZAI_RAW_KEY="api_id.secret"
+export ZAI_RAW_KEY="paste-your-zai-raw-key-here"
 ```
 
 ## Setup
@@ -78,7 +78,7 @@ This creates:
 Start the relay with automatic JWT refresh:
 
 ```bash
-export ZAI_RAW_KEY="api_id.secret"
+export ZAI_RAW_KEY="paste-your-zai-raw-key-here"
 work/glm-relay serve
 ```
 
@@ -96,6 +96,64 @@ work/glm-relay health
 work/glm-relay logs
 work/glm-relay stop
 ```
+
+## Offline reliability checks
+
+The default reliability suite is fully offline. It uses redacted Codex request
+fixtures, a fake GLM Chat Completions upstream, and wrapper unit tests:
+
+```bash
+cargo test --manifest-path third_party/codex-relay/Cargo.toml
+python3 -m unittest discover -s tests
+```
+
+GitHub Actions runs the same offline gates on pull requests.
+
+These checks prove:
+
+```text
+Codex Responses request -> GLM Chat Completions request
+GLM SSE stream          -> Codex Responses SSE events
+normal tool call        -> function_call_output follow-up
+wrapper config          -> JWT/profile/denylist/state behavior
+```
+
+They do not call Z.ai and do not require `ZAI_RAW_KEY`.
+
+### Fixture maintenance
+
+GLM relay fixtures live under:
+
+```text
+third_party/codex-relay/tests/fixtures/codex_glm_current/
+```
+
+When refreshing fixtures after a Codex upgrade, keep only the smallest shape
+needed to exercise the protocol behavior. Do not commit raw Z.ai keys,
+generated JWTs, bearer tokens, relay history, logs, full user prompts, or
+unredacted local home paths.
+
+Live GLM checks are still useful as a final smoke test, but they are not the
+foundation for reliability because they depend on credentials, provider
+availability, and account balance.
+
+Run a live smoke only after the offline suite is green:
+
+```bash
+export ZAI_RAW_KEY="paste-your-zai-raw-key-here"
+work/glm-relay live-smoke
+```
+
+This starts the relay if needed, makes one real text request through GLM-5.2,
+and stops the smoke relay afterward. It proves current auth, endpoint, model,
+and relay wiring. To also ask GLM for a normal tool call, run:
+
+```bash
+work/glm-relay live-smoke --include-tool-call
+```
+
+The tool-call check is stricter and more provider-behavior-sensitive, so keep
+the text smoke as the first live gate.
 
 ## Tool policy
 

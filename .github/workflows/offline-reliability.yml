@@ -1,0 +1,86 @@
+name: Offline reliability
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  relay:
+    name: Relay fixtures
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path third_party/codex-relay/Cargo.toml -- --check
+
+      - name: Run relay tests
+        run: cargo test --manifest-path third_party/codex-relay/Cargo.toml
+
+  wrapper:
+    name: Wrapper and fixture hygiene
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run wrapper tests
+        run: python3 -m unittest discover -s tests
+
+      - name: Scan fixtures and docs for leaked secrets
+        run: |
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import re
+
+          scan_files = [
+              pathlib.Path("README.md"),
+              pathlib.Path("work/glm-relay.md"),
+              pathlib.Path("third_party/codex-relay/tests/fixtures/VERSIONS.md"),
+          ]
+          fixture_root = pathlib.Path("third_party/codex-relay/tests/fixtures/codex_glm_current")
+
+          for path in fixture_root.rglob("*.json"):
+              json.loads(path.read_text())
+
+          scan_files.extend(path for path in fixture_root.rglob("*") if path.is_file())
+
+          forbidden = [
+              "Bearer ",
+              "Authorization:",
+              "gho_",
+              "/Users/",
+              "openai.sk-",
+              "api_id.secret",
+          ]
+          jwt_like = re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
+
+          for path in scan_files:
+              text = path.read_text(errors="ignore")
+              for needle in forbidden:
+                  if needle in text:
+                      raise SystemExit(f"forbidden pattern {needle!r} in {path}")
+              if jwt_like.search(text):
+                  raise SystemExit(f"jwt-like token in {path}")
+
+          print("json parse and fixture/doc secret scan ok")
+          PY

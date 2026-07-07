@@ -7,6 +7,7 @@ Update this file whenever you regenerate fixtures or change the target model set
 
 | Fixture dir | Codex CLI version | Captured |
 |---|---|---|
+| `codex_glm_current/` | Codex Desktop / CLI GLM relay representative shapes | 2026-07-06 |
 | `codex_0_128_0/` | 0.128.0 | 2026-05-07 |
 
 Each fixture is a **minimized, hand-shrunk** representative of the real wire
@@ -20,6 +21,22 @@ To regenerate after a Codex upgrade:
 2. Trim long strings and tool lists down to the smallest payload that still
    exercises the relevant feature.
 3. Add an entry above and update `tests/compat_codex_0_128.rs` to load it.
+
+## GLM relay fixtures
+
+`codex_glm_current/` contains minimized, redacted fixtures for the GLM relay
+wrapper path. They are not full prompt captures. They preserve the protocol
+features the wrapper must keep reliable:
+
+- `instructions`, `input`, `tools`, `stream`, and unknown top-level Codex fields
+- GLM `thinking` enablement on outbound Chat Completions requests
+- normal tool calls and function call outputs
+- parallel function call replay
+- default subagent / multi-agent tool denylist behavior
+- GLM-style SSE chunks for text, reasoning, and tool-call responses
+
+Do not commit raw Z.ai keys, generated JWTs, bearer tokens, relay history,
+logs, full user prompts, or unredacted local home paths into these fixtures.
 
 ## DeepSeek (live tests)
 

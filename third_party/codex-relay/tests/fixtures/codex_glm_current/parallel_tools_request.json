@@ -1,0 +1,21 @@
+{
+  "model": "glm-5.2",
+  "input": [
+    {
+      "type": "function_call",
+      "call_id": "call_exec",
+      "name": "exec_command",
+      "arguments": "{\"cmd\":\"pwd\"}"
+    },
+    {
+      "type": "function_call",
+      "call_id": "call_js",
+      "namespace": "mcp__node_repl",
+      "name": "js",
+      "arguments": "{\"code\":\"1 + 1\"}"
+    }
+  ],
+  "tools": [],
+  "stream": false,
+  "parallel_tool_calls": true
+}

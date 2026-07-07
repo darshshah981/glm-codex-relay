@@ -1,0 +1,5 @@
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_exec","function":{"name":"exec_command","arguments":"{\"cmd\":\"pwd\"}"}}]}}]}
+
+data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":4,"total_tokens":15}}}
+
+data: [DONE]

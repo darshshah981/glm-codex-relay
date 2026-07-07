@@ -6,7 +6,7 @@ It does not store the raw Z.ai key. Set it only in the shell that starts the
 relay:
 
 ```bash
-export ZAI_RAW_KEY="api_id.secret"
+export ZAI_RAW_KEY="paste-your-zai-raw-key-here"
 ```
 
 ## One-time setup
@@ -62,6 +62,53 @@ Use the profile with Codex:
 
 ```bash
 codex --profile glm52-relay exec --skip-git-repo-check "Say exactly: GLM relay works"
+```
+
+## Offline reliability checks
+
+Run the relay and wrapper reliability suite without live Z.ai credentials:
+
+```bash
+cargo test --manifest-path third_party/codex-relay/Cargo.toml
+python3 -m unittest discover -s tests
+```
+
+The Rust tests replay redacted Codex request fixtures and fake GLM SSE streams
+through the vendored relay. The Python tests cover wrapper behavior such as JWT
+generation, profile writing, install-source selection, default tool denylist,
+state metadata, and secret hygiene.
+
+Fixture refresh rules:
+
+```text
+keep: protocol shape, minimized tool schemas, representative stream chunks
+drop: raw keys, generated JWTs, bearer tokens, logs, relay history, full prompts
+```
+
+Use live GLM calls only as a final smoke test after the offline suite passes.
+
+## Live smoke
+
+The live smoke answers a different question than the offline suite:
+
+```text
+offline tests -> does our relay logic work for known protocol shapes?
+live smoke    -> do current Z.ai auth, endpoint, model, and relay wiring work now?
+```
+
+Run it only when you are ready to spend a tiny live request:
+
+```bash
+export ZAI_RAW_KEY="paste-your-zai-raw-key-here"
+work/glm-relay live-smoke
+```
+
+By default it starts the relay if needed, sends one small text request through
+`/v1/responses`, verifies output text came back, and stops the smoke relay.
+Use the stricter optional tool-call check after the text smoke passes:
+
+```bash
+work/glm-relay live-smoke --include-tool-call
 ```
 
 ## Auth refresh
