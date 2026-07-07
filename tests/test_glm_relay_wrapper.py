@@ -135,6 +135,7 @@ class GlmRelayWrapperTests(unittest.TestCase):
             self.assertNotIn("test-secret", state_text)
             self.assertNotIn(captured["env"]["CODEX_RELAY_API_KEY"], state_text)
             self.assertNotIn(captured["env"]["CODEX_RELAY_API_KEY"], self.mod.LOG_FILE.read_text(encoding="utf-8"))
+            self.assertNotIn("ZAI_RAW_KEY", captured["env"])
 
     def test_relay_state_mismatches_detects_runtime_safety_changes(self):
         args = argparse.Namespace(

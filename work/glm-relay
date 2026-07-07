@@ -177,6 +177,11 @@ def worker_summary(metadata, run_dir):
 def worker_env(codex_home):
     env = os.environ.copy()
     env["CODEX_HOME"] = str(codex_home)
+    scrub_relay_secret_env(env)
+    return env
+
+
+def scrub_relay_secret_env(env):
     for key in list(env):
         if key.startswith("ZAI_") or key.startswith("CODEX_RELAY_"):
             env.pop(key, None)
@@ -244,7 +249,7 @@ def start_relay(args):
     token, exp = generate_zai_jwt(raw_key, ttl_seconds=args.jwt_ttl_seconds)
     relay_bin = find_relay_binary()
 
-    env = os.environ.copy()
+    env = scrub_relay_secret_env(os.environ.copy())
     env["CODEX_RELAY_UPSTREAM"] = args.upstream
     env["CODEX_RELAY_API_KEY"] = token
     env["CODEX_RELAY_PORT"] = str(args.port)

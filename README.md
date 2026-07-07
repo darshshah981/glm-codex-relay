@@ -183,6 +183,7 @@ Each run stores the task prompt, stdout, stderr, exit code, redacted metadata,
 and a short summary. Treat the bundle as local sensitive data: it can contain
 prompts, tool output, and repo context. Codex should review the worker output,
 git diff, and tests before trusting or shipping GLM's changes.
+Test this lane first with documentation-only tasks before trusting it for code changes.
 
 ## Tool policy
 
